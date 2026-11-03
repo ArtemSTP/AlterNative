@@ -1,0 +1,88 @@
+# Справочник команд Excel Viewer.
+# words — операторы и ключевые слова для автодополнения в строке команд
+#   (поиск по текущему слову, разделитель — пробел; подстановка — по Tab).
+# syntax — примеры синтаксиса (полные команды).
+
+words:
+  - new
+  - column
+  - row
+  - between
+  - and
+  - move
+  - to
+  - start
+  - end
+  - delete
+  - color
+  - union
+  - split
+  - type
+  - width
+  - height
+  - size
+  - normalize
+  - border
+  - clear
+  - help
+  - left
+  - right
+  - up
+  - down
+  - all
+  - null
+  - default
+  - grey
+  - red
+  - yellow
+  - green
+  - blue
+  - url
+  - b
+  - i
+  - d
+
+syntax:
+  - "A1 = текст"
+  - "A1, B2 -> C3 = текст"
+  - "type A1 = B and I"
+  - "new column between C and D"
+  - "new row between 2 and 5"
+  - "move D between A and B"
+  - "move D to start"
+  - "move row 3 to end"
+  - "delete column C"
+  - "delete row 2"
+  - "color A1, B3 -> C4 = red"
+  - "color 2 -> 3 = blue"
+  - "union A1 -> C3"
+  - "split A1 -> C3"
+  - "B width = 150%"
+  - "A1 width = 50%"
+  - "B21 -> C23 width = 50%"
+  - "7 height = 120%"
+  - "A1 height = 50%"
+  - "B21 -> C23 size = 200%"
+  - "border B12 = up, right"
+  - "border A1 -> C3 = all"
+  - "border 5 = null"
+  - "clear E10 -> H20"
+  - "clear A1, B2 -> C3"
+  - "normalize"
+  - "help"
+
+help:
+  - "A1 = текст — записать значение; также списки «A1, B2» и диапазон «A1 -> C3»"
+  - "type A1 = B and I — начертание шрифта: B, I, _ (подчёркивание), url, d (сброс)"
+  - "new column / new row [between C and D] — добавить столбец/строку"
+  - "move D to start | move D to end | move D between A and B — переместить столбец/строку"
+  - "delete column C / delete row 2 — удалить столбец/строку"
+  - "color A1, 2, C = red — фон ячеек/строк/столбцов: default, grey, red, yellow, green, blue"
+  - "border A1 -> C3 = up, right — рамка 1pt: left/right/up/down/all; null — снять рамку"
+  - "clear E10 -> H20 — очистить содержимое и тип (type=default); списки и диапазоны"
+  - "union A1 -> C3 — объединить ячейки; split A1 -> C3 — разъединить"
+  - "C width = 150% / 7 height = 50% — ширина столбца / высота строки в процентах"
+  - "C3 -> D5 size = 200% — масштаб ширины и высоты диапазона ячеек"
+  - "normalize — подогнать ширину столбцов под текст, высоты строк сбросить"
+  - "Ctrl + колесо мыши над таблицей — масштаб 20–500% (в xlsx не переносится)"
+  - "Tab — подставить подсказку оператора из commands.yaml"

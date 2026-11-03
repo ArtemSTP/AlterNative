@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Excel Viewer</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div id="app">
+        <header id="toolbar">
+            <div class="toolbar-left">
+                <input type="text" id="project-url" class="gitlab-only" placeholder="https://gitlab.example.com/group/project">
+                <input type="password" id="token" class="gitlab-only" placeholder="Private Token">
+                <input type="text" id="ref" class="gitlab-only" placeholder="branch (main)" value="main">
+                <input type="text" id="folder" class="gitlab-only" placeholder="path (data/)" value="data">
+                <button id="btn-load">Загрузить</button>
+            </div>
+            <div class="toolbar-right">
+                <button id="btn-open">Открыть</button>
+                <button id="btn-save">Сохранить</button>
+                <button id="btn-upload">Загрузить .xlsx</button>
+                <button id="btn-download">Скачать .xlsx</button>
+            </div>
+        </header>
+        <main id="content">
+            <aside id="tree-panel">
+                <div id="tree"></div>
+            </aside>
+            <section id="view-panel">
+                <div id="sheet-tabs"></div>
+                <div id="table-container">
+                    <p class="placeholder">Выберите файл из дерева слева</p>
+                </div>
+            </section>
+        </main>
+        <div id="command-area">
+            <div id="help-banner" class="help-banner" hidden></div>
+            <div id="command-error" class="command-error" hidden></div>
+            <input type="text" id="command-input" autocomplete="off" spellcheck="false"
+                   placeholder="Команда: A1 = текст | move D to end | color A1 = red | union A1 -> B2 | B width = 150% | normalize | Tab — подсказка из commands.yaml">
+            <span id="command-hint" class="command-hint"></span>
+        </div>
+    </div>
+
+    <input type="file" id="file-input" accept=".xlsx" hidden>
+
+    <script src="vendor/exceljs.min.js"></script>
+    <script src="js/config.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/local-api.js"></script>
+    <script src="js/converter.js"></script>
+    <script src="js/tree.js"></script>
+    <script src="js/view.js"></script>
+    <script src="js/dialog.js"></script>
+    <script src="js/draft.js"></script>
+    <script src="js/commands.js"></script>
+    <script src="js/complete.js"></script>
+    <script src="js/core.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
