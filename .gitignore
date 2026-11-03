@@ -1,0 +1,12 @@
+# Артефакты сборки Pages
+public/
+
+# Локальные данные и стенд (не публиковать)
+sandbox/
+__pycache__/
+*.pyc
+*.log
+
+# IDE
+.vscode/
+.idea/
