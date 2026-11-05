@@ -220,6 +220,28 @@ const Converter = (() => {
                 const r2 = Number(m.r1) + 1;
                 const c2 = Number(m.c1) + 1;
                 if (!(r1 >= 1) || !(c1 >= 1) || r2 < r1 || c2 < c1) continue;
+
+                // В xlsx рамку объединённой ячейки задаёт только мастер-ячейка,
+                // поэтому собираем внешний периметр со всех ячеек диапазона.
+                const at = (r, c) => (sheet.borders || {})[`${r}:${c}`] || {};
+                const outer = {};
+                for (let c = m.c0; c <= m.c1; c++) {
+                    if (at(m.r0, c).up) outer.up = 1;
+                    if (at(m.r1, c).down) outer.down = 1;
+                }
+                for (let r = m.r0; r <= m.r1; r++) {
+                    if (at(r, m.c0).left) outer.left = 1;
+                    if (at(r, m.c1).right) outer.right = 1;
+                }
+
+                const thin = { style: 'thin', color: { argb: 'FF000000' } };
+                const border = {};
+                if (outer.up) border.top = thin;
+                if (outer.down) border.bottom = thin;
+                if (outer.left) border.left = thin;
+                if (outer.right) border.right = thin;
+                ws.getCell(r1, c1).border = border;
+
                 try {
                     ws.mergeCells(r1, c1, r2, c2);
                 } catch (e) {

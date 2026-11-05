@@ -4,6 +4,46 @@
 (() => {
     const $ = (id) => document.getElementById(id);
 
+    const appEl = $('app');
+    const btnTree = $('btn-tree');
+    const treeBackdrop = $('tree-backdrop');
+    const narrowQuery = window.matchMedia('(max-width: 720px)');
+
+    function isNarrow() {
+        return narrowQuery.matches;
+    }
+
+    function setTreeOpen(open) {
+        if (!appEl) return;
+        appEl.dataset.tree = open ? 'open' : 'closed';
+        if (btnTree) {
+            btnTree.setAttribute('aria-expanded', String(open));
+            btnTree.title = open ? 'Скрыть дерево файлов' : 'Показать дерево файлов';
+        }
+        if (treeBackdrop) treeBackdrop.hidden = !(open && isNarrow());
+    }
+
+    function toggleTree() {
+        setTreeOpen(!appEl || appEl.dataset.tree !== 'open');
+    }
+
+    // На телефоне дерево стартует свёрнутым, на десктопе — раскрытым
+    setTreeOpen(!isNarrow());
+
+    if (btnTree) btnTree.addEventListener('click', toggleTree);
+    if (treeBackdrop) treeBackdrop.addEventListener('click', () => setTreeOpen(false));
+
+    const onViewportChange = (event) => setTreeOpen(!event.matches);
+    if (narrowQuery.addEventListener) narrowQuery.addEventListener('change', onViewportChange);
+    else if (narrowQuery.addListener) narrowQuery.addListener(onViewportChange);
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && isNarrow() &&
+            appEl && appEl.dataset.tree === 'open') {
+            setTreeOpen(false);
+        }
+    });
+
     const btnLoad = $('btn-load');
     const btnOpen = $('btn-open');
     const btnSave = $('btn-save');
@@ -165,7 +205,7 @@
 
     async function boot() {
         const config = await Config.load();
-        const localMode = config.test_local === true;
+        const localMode = Mode.isLocal(config, window.location.hostname);
 
         // Справочник операторов для автодополнения (Tab)
         Complete.load();
@@ -230,6 +270,7 @@
             await Core.openFile(path);
             Draft.clear();
             updateButtons();
+            if (isNarrow()) setTreeOpen(false);
         } catch (e) {
             setStatus(e.message, 'error');
         }

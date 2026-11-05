@@ -220,6 +220,25 @@ const SheetView = (() => {
         if (b.down) td.style.borderBottom = BORDER_CSS;
     }
 
+    // Рамка объединённой ячейки — только внешний периметр, собранный
+    // из сторон всех покрытых ячеек (их и видят после split).
+    function mergedBorder(sheet, merge) {
+        const borders = sheet.borders || {};
+        const at = (r, c) => borders[`${r}:${c}`] || {};
+        const out = {};
+
+        for (let c = merge.c0; c <= merge.c1; c++) {
+            if (at(merge.r0, c).up) out.up = 1;
+            if (at(merge.r1, c).down) out.down = 1;
+        }
+        for (let r = merge.r0; r <= merge.r1; r++) {
+            if (at(r, merge.c0).left) out.left = 1;
+            if (at(r, merge.c1).right) out.right = 1;
+        }
+
+        return out;
+    }
+
     function applyFont(td, font) {
         if (!font) return;
         if (font.bold) td.style.fontWeight = '700';
@@ -332,7 +351,9 @@ const SheetView = (() => {
                 }
 
                 applyFont(td, getFont(sheet, r, c));
-                applyBorder(td, sheet.borders && sheet.borders[`${r}:${c}`]);
+                applyBorder(td, merge
+                    ? mergedBorder(sheet, merge)
+                    : (sheet.borders && sheet.borders[key]));
                 if (dirty.has(cellKey(sheet, r, c))) td.classList.add('modified');
 
                 td.addEventListener('input', () => commitCell(td, sheet, r, c));
@@ -828,6 +849,40 @@ const SheetView = (() => {
         structuralDirty = true;
     }
 
+    // border ... = all:
+    // обычный диапазон — рамка вокруг каждой ячейки,
+    // объединённый — только по периметру всего диапазона.
+    function setBordersAll(ranges) {
+        const sheet = getActiveSheet();
+        if (!sheet) return;
+
+        const merges = getMerges(sheet);
+        sheet.borders = sheet.borders || {};
+
+        for (const rg of ranges) {
+            const isMerge = merges.some(m => m &&
+                m.r0 === rg.r0 && m.c0 === rg.c0 && m.r1 === rg.r1 && m.c1 === rg.c1);
+
+            if (isMerge) {
+                // Внутренние стороны у объединённой ячейки не нужны:
+                // после split должна остаться только внешняя рамка.
+                for (let r = rg.r0; r <= rg.r1; r++) {
+                    for (let c = rg.c0; c <= rg.c1; c++) delete sheet.borders[`${r}:${c}`];
+                }
+                setBorders([rg], new Set(['left', 'right', 'up', 'down']));
+                continue;
+            }
+
+            for (let r = rg.r0; r <= rg.r1; r++) {
+                for (let c = rg.c0; c <= rg.c1; c++) {
+                    sheet.borders[`${r}:${c}`] = { up: 1, down: 1, left: 1, right: 1 };
+                }
+            }
+        }
+
+        structuralDirty = true;
+    }
+
     function clearBorders(ranges) {
         const sheet = getActiveSheet();
         if (!sheet || !sheet.borders) return;
@@ -935,6 +990,7 @@ const SheetView = (() => {
         getZoom,
         setZoom,
         setBorders,
+        setBordersAll,
         clearBorders,
         refresh
     };

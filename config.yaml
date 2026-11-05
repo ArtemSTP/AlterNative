@@ -1,6 +1,6 @@
 # Режим локального стенда.
-# true  — работать с папкой sandbox/json через test/server.py
-# false — работать с GitLab (перед публикацией на GitLab Pages)
+# true  — работать с папкой sandbox/json через test/server.py (только на 127.0.0.1/localhost)
+# false — работать с GitLab (перед публикацией на GitLab Pages / GitHub Pages)
 test_local: false
 
 # Адрес локального сервиса (порт проверен как свободный)

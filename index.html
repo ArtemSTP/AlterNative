@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Excel Viewer</title>
     <link rel="stylesheet" href="css/style.css">
 </head>
@@ -10,20 +10,24 @@
     <div id="app">
         <header id="toolbar">
             <div class="toolbar-left">
+                <button id="btn-tree" type="button" class="btn-tree"
+                        aria-controls="tree-panel" aria-expanded="true"
+                        title="Показать/скрыть дерево файлов" aria-label="Дерево файлов">☰</button>
                 <input type="text" id="project-url" class="gitlab-only" placeholder="https://gitlab.example.com/group/project">
                 <input type="password" id="token" class="gitlab-only" placeholder="Private Token">
+                <button id="btn-load">Загрузить</button>
                 <input type="text" id="ref" class="gitlab-only" placeholder="branch (main)" value="main">
                 <input type="text" id="folder" class="gitlab-only" placeholder="path (data/)" value="data">
-                <button id="btn-load">Загрузить</button>
             </div>
             <div class="toolbar-right">
                 <button id="btn-open">Открыть</button>
                 <button id="btn-save">Сохранить</button>
-                <button id="btn-upload">Загрузить .xlsx</button>
-                <button id="btn-download">Скачать .xlsx</button>
+                <button id="btn-upload">Загрузить<span class="wide-only"> .xlsx</span></button>
+                <button id="btn-download">Скачать<span class="wide-only"> .xlsx</span></button>
             </div>
         </header>
         <main id="content">
+            <div id="tree-backdrop" hidden></div>
             <aside id="tree-panel">
                 <div id="tree"></div>
             </aside>
@@ -47,6 +51,7 @@
 
     <script src="vendor/exceljs.min.js"></script>
     <script src="js/config.js"></script>
+    <script src="js/mode.js"></script>
     <script src="js/api.js"></script>
     <script src="js/local-api.js"></script>
     <script src="js/converter.js"></script>
