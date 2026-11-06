@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Responsive test</title>
+    <style>
+        iframe { border: 1px solid #ccc; display: block; }
+    </style>
+</head>
+<body>
+    <pre id="results"></pre>
+    <div id="frames"></div>
+    <script>
+        const results = [];
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+        function assert(cond, msg) {
+            if (!cond) throw new Error(msg || 'assertion failed');
+        }
+
+        async function check(name, fn) {
+            try {
+                await fn();
+                results.push({ name, ok: true });
+            } catch (e) {
+                results.push({ name, ok: false, error: e.message });
+            }
+        }
+
+        async function waitTable(frame) {
+            for (let i = 0; i < 400; i++) {
+                const doc = frame.contentDocument;
+                if (doc && doc.querySelector('.excel-table')) return doc;
+                await sleep(50);
+            }
+            throw new Error('таблица не появилась');
+        }
+
+        // 852×393 — iPhone 14 Pro в ландшафте (проверяется ниже как широкий экран)
+        const widths = [320, 360, 393, 414, 600, 768, 852, 900, 1024, 1280, 1600];
+        const frames = new Map();
+
+        for (const width of widths) {
+            const frame = document.createElement('iframe');
+            frame.src = '/';
+            frame.style.width = width + 'px';
+            frame.style.height = width === 852 ? '393px' : '800px';
+            frame.dataset.width = String(width);
+            document.getElementById('frames').appendChild(frame);
+            frames.set(width, frame);
+        }
+
+        function frameDoc(width) {
+            return frames.get(width).contentDocument;
+        }
+
+        function frameWin(width) {
+            return frames.get(width).contentWindow;
+        }
+
+        (async () => {
+            try {
+                await Promise.all(Array.from(frames.values()).map(async (frame) => {
+                    await new Promise(resolve => {
+                        const doc = frame.contentDocument;
+                        if (doc && doc.readyState === 'complete' && doc.querySelector('.excel-table')) {
+                            resolve();
+                        } else {
+                            frame.addEventListener('load', resolve, { once: true });
+                        }
+                    });
+                    await waitTable(frame);
+                }));
+            } catch (e) {
+                results.push({ name: 'загрузка приложения', ok: false, error: e.message });
+            }
+
+            for (const width of widths) {
+                await check('ширина ' + width + ': нет переполнения и корректный режим', () => {
+                    const doc = frameDoc(width);
+                    const win = frameWin(width);
+                    const app = doc.getElementById('app');
+                    const toolbar = doc.getElementById('toolbar');
+                    const content = doc.getElementById('content');
+                    const view = doc.getElementById('view-panel');
+                    const command = doc.getElementById('command-area');
+                    const tree = doc.getElementById('tree-panel');
+
+                    assert(doc.documentElement.scrollWidth <= doc.documentElement.clientWidth + 1,
+                        'страница шире viewport: ' +
+                        doc.documentElement.scrollWidth + '/' + doc.documentElement.clientWidth);
+                    assert(toolbar.scrollWidth <= toolbar.clientWidth + 1,
+                        'тулбар шире контейнера: ' + toolbar.scrollWidth + '/' + toolbar.clientWidth);
+
+                    const narrow = width <= 720;
+                    assert(app.dataset.tree === (narrow ? 'closed' : 'open'),
+                        'состояние дерева: ' + app.dataset.tree);
+
+                    const margin = parseFloat(win.getComputedStyle(command).marginLeft);
+                    assert(Math.abs(margin - (narrow ? 0 : 260)) < 1,
+                        'отступ строки команд: ' + margin);
+
+                    const treeWidth = narrow ? 0 : 260;
+                    assert(Math.round(view.getBoundingClientRect().width) ===
+                        Math.round(content.getBoundingClientRect().width) - treeWidth,
+                        'ширина view: ' + Math.round(view.getBoundingClientRect().width) +
+                        ', content=' + Math.round(content.getBoundingClientRect().width));
+                    assert(narrow ? tree.getBoundingClientRect().width === 0 : treeWidth > 0,
+                        'дерево должно быть ' + (narrow ? 'скрыто' : 'видно'));
+                });
+            }
+
+            await check('телефон 393×852: drawer, затемнение и закрытие', async () => {
+                const doc = frameDoc(393);
+                const win = frameWin(393);
+                const app = doc.getElementById('app');
+                const panel = doc.getElementById('tree-panel');
+                const backdrop = doc.getElementById('tree-backdrop');
+                const button = doc.getElementById('btn-tree');
+
+                assert(app.dataset.tree === 'closed', 'дерево должно быть свёрнуто');
+                assert(panel.getBoundingClientRect().width === 0, 'дерево видно до открытия');
+
+                button.click();
+                await sleep(150);
+                assert(app.dataset.tree === 'open', 'кнопка не открыла дерево');
+                assert(button.getAttribute('aria-expanded') === 'true', 'aria-expanded не обновлён');
+                assert(panel.getBoundingClientRect().width > 0, 'панель не показана');
+                assert(win.getComputedStyle(panel).position === 'absolute', 'панель не overlay');
+                assert(!backdrop.hidden, 'затемнение не показано');
+                assert(win.getComputedStyle(backdrop).display === 'block', 'затемнение не отрисовано');
+
+                backdrop.click();
+                await sleep(150);
+                assert(app.dataset.tree === 'closed', 'тап по затемнению не закрыл дерево');
+
+                button.click();
+                await sleep(80);
+                doc.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                await sleep(80);
+                assert(app.dataset.tree === 'closed', 'Escape не закрыл дерево');
+            });
+
+            await check('десктоп 1280×800: сворачивание и разворачивание', async () => {
+                const doc = frameDoc(1280);
+                const win = frameWin(1280);
+                const app = doc.getElementById('app');
+                const panel = doc.getElementById('tree-panel');
+                const command = doc.getElementById('command-area');
+                const view = doc.getElementById('view-panel');
+                const button = doc.getElementById('btn-tree');
+
+                assert(app.dataset.tree === 'open', 'дерево должно быть раскрыто');
+                assert(panel.getBoundingClientRect().width >= 200, 'дерево не показано');
+
+                button.click();
+                await sleep(120);
+                assert(panel.getBoundingClientRect().width === 0, 'дерево не свернулось');
+                assert(parseFloat(win.getComputedStyle(command).marginLeft) === 0,
+                    'строка команд не сдвинулась');
+                assert(view.getBoundingClientRect().width > 1200, 'таблица не расширилась');
+
+                button.click();
+                await sleep(120);
+                assert(panel.getBoundingClientRect().width >= 200, 'дерево не развернулось');
+            });
+
+            await check('телефон: выбор файла закрывает дерево', async () => {
+                const frame = frames.get(393);
+                const win = frame.contentWindow;
+                win.localStorage.removeItem('excel-viewer:draft:' + win.location.origin + '/');
+                win.location.reload();
+                await new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
+                const doc = await waitTable(frame);
+
+                let file = null;
+                for (let i = 0; i < 200 && !file; i++) {
+                    file = doc.querySelector('.tree-file');
+                    if (!file) await sleep(50);
+                }
+                assert(file, 'в дереве нет файлов');
+
+                doc.getElementById('btn-tree').click();
+                await sleep(120);
+                assert(doc.getElementById('app').dataset.tree === 'open', 'дерево не открылось');
+
+                file.click();
+                // на всякий случай: если всплыл диалог несохранённых — удалить черновик
+                for (let i = 0; i < 60; i++) {
+                    if (doc.getElementById('app').dataset.tree === 'closed') break;
+                    const discard = doc.querySelector('.modal-actions .btn-danger');
+                    if (discard) discard.click();
+                    await sleep(50);
+                }
+                assert(doc.getElementById('app').dataset.tree === 'closed',
+                    'дерево не закрылось после выбора файла');
+            });
+
+            const failed = results.filter(r => !r.ok);
+            document.getElementById('results').textContent = results
+                .map(r => (r.ok ? 'PASS ' : 'FAIL ') + r.name + (r.ok ? '' : ' — ' + r.error))
+                .join('\n') + '\nSUMMARY: ' + (failed.length ? 'FAIL' : 'PASS') +
+                ' (' + (results.length - failed.length) + '/' + results.length + ')';
+            document.body.dataset.status = failed.length ? 'fail' : 'pass';
+        })();
+    </script>
+</body>
+</html>

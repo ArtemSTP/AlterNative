@@ -12,6 +12,16 @@ const Core = (() => {
     let baseCommitId = null;
     let forceCreate = false;
 
+    function setBackend(provider) {
+        if (provider === 'github') {
+            mode = 'github';
+            api = GitHubAPI;
+        } else {
+            mode = 'gitlab';
+            api = GitLabAPI;
+        }
+    }
+
     function init(options) {
         const opts = options || {};
         if (opts.status) setStatus = opts.status;
@@ -22,8 +32,7 @@ const Core = (() => {
             LocalAPI.init(opts.localUrl);
             folder = '';
         } else {
-            mode = 'gitlab';
-            api = GitLabAPI;
+            setBackend(opts.provider);
         }
     }
 
@@ -57,8 +66,11 @@ const Core = (() => {
 
     function ensureReady() {
         if (!api.isInitialized()) {
-            throw new Error(mode === 'local'
-                ? 'Локальный сервис не настроен. Проверьте local_api в config.yaml.'
+            if (mode === 'local') {
+                throw new Error('Локальный сервис не настроен. Проверьте local_api в config.yaml.');
+            }
+            throw new Error(mode === 'github'
+                ? 'Сначала подключите репозиторий GitHub (owner/repo и токен).'
                 : 'Сначала загрузите проект GitLab (URL и Private Token).');
         }
     }
@@ -75,16 +87,22 @@ const Core = (() => {
         return items;
     }
 
-    async function loadProject({ projectUrl, token, ref, folder: projectFolder }) {
+    async function loadProject({ projectUrl, token, ref, folder: projectFolder, provider }) {
         if (mode === 'local') {
             return reloadTree();
         }
 
+        setBackend(provider);
+
         if (!projectUrl || !token) {
-            throw new Error('Укажите URL проекта и Private Token');
+            throw new Error(mode === 'github'
+                ? 'Укажите репозиторий GitHub (owner/repo) и токен'
+                : 'Укажите URL проекта GitLab и Private Token');
         }
 
-        GitLabAPI.init(projectUrl, token, ref);
+        if (mode === 'github') GitHubAPI.init(projectUrl, token, ref);
+        else GitLabAPI.init(projectUrl, token, ref);
+
         folder = (projectFolder || '').replace(/^\/+|\/+$/g, '');
 
         // Документ предыдущего проекта больше не актуален
@@ -196,8 +214,13 @@ const Core = (() => {
         }
 
         status(`Чтение ${file.name}…`, 'saving');
-        const buffer = await Converter.readFile(file);
-        const json = Converter.parse(await Converter.xlsxToJson(buffer));
+        let json;
+        try {
+            const buffer = await Converter.readFile(file);
+            json = Converter.parse(await Converter.xlsxToJson(buffer));
+        } catch (e) {
+            throw new Error('Не удалось прочитать .xlsx: ' + (e.message || e));
+        }
 
         SheetView.setWorkbook(json);
         currentPath = null;
@@ -209,22 +232,27 @@ const Core = (() => {
     }
 
     async function exportXlsx() {
-        ensureReady();
-        if (!currentPath) {
-            throw new Error('Сначала сохраните таблицу в папку json');
-        }
-        if (SheetView.hasChanges()) {
-            throw new Error('Сначала сохраните изменения');
+        if (!SheetView.getActiveSheet()) {
+            throw new Error('Нет открытой таблицы');
         }
 
         status('Формирование .xlsx…', 'saving');
-        const file = await api.readFile(currentPath);
-        const json = Converter.parse(file.content);
-        const buffer = await Converter.jsonToXlsx(json);
+        // Экспортируем текущее содержимое из памяти — репозиторий для этого не нужен
+        let buffer;
+        try {
+            buffer = await Converter.jsonToXlsx(SheetView.getWorkbook());
+        } catch (e) {
+            throw new Error('Не удалось сформировать .xlsx: ' + (e.message || e));
+        }
 
-        const name = currentPath.split('/').pop().replace(/\.json$/i, '') + '.xlsx';
+        const base = currentPath
+            ? currentPath.split('/').pop().replace(/\.json$/i, '')
+            : (SheetView.getActiveSheet().name || 'таблица');
+        const name = String(base).replace(/[\\/:*?"<>|]+/g, '_') + '.xlsx';
+
         Converter.download(buffer, name);
-        status(`Скачано: ${name}`, 'saved');
+        status(`Файл сформирован: ${name}`, 'saved');
+        return name;
     }
 
     function getState() {

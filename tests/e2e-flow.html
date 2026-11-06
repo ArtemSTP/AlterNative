@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>UI e2e</title>
+</head>
+<body>
+    <pre id="results"></pre>
+    <iframe id="app" src="/" style="width:1200px;height:800px;border:1px solid #ccc"></iframe>
+
+    <script>
+        const results = [];
+        const frame = document.getElementById('app');
+
+        function assert(cond, msg) {
+            if (!cond) throw new Error(msg || 'assertion failed');
+        }
+
+        function sleep(ms) {
+            return new Promise(r => setTimeout(r, ms));
+        }
+
+        function decodeB64(b64) {
+            const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+            return new TextDecoder('utf-8').decode(bytes);
+        }
+
+        async function waitFor(fn, label, timeout = 15000) {
+            const started = Date.now();
+            while (Date.now() - started < timeout) {
+                try {
+                    const value = fn();
+                    if (value) return value;
+                } catch (e) { /* ещё не готово */ }
+                await sleep(50);
+            }
+            throw new Error('таймаут: ' + label);
+        }
+
+        function doc() {
+            return frame.contentDocument;
+        }
+
+        function q(sel) {
+            return doc().querySelector(sel);
+        }
+
+        function qa(sel) {
+            return Array.from(doc().querySelectorAll(sel));
+        }
+
+        function setCell(row, col, value) {
+            const cell = q(`td[data-row="${row}"][data-col="${col}"]`);
+            assert(cell, `нет ячейки ${row}:${col}`);
+            cell.textContent = value;
+            cell.dispatchEvent(new frame.contentWindow.Event('input', { bubbles: true }));
+            return cell;
+        }
+
+        function modalButton(label) {
+            return qa('.modal-actions .btn').find(b => b.textContent === label);
+        }
+
+        async function waitStatus(text) {
+            return waitFor(() => {
+                const el = q('#status');
+                return el && el.textContent.includes(text) ? el.textContent : null;
+            }, 'статус «' + text + '»');
+        }
+
+        async function run(name, fn) {
+            try {
+                await fn();
+                results.push({ name, ok: true });
+            } catch (e) {
+                results.push({ name, ok: false, error: e.message });
+            }
+        }
+
+        (async () => {
+            // чистим возможные прошлые артефакты состояния
+            localStorage.removeItem('excel-viewer:draft:' + location.origin + '/');
+            const runId = Date.now();
+            const flowPath = 'e2e/flow-a-' + runId + '.json';
+            const importPath = 'e2e/import-' + runId + '.json';
+
+            await new Promise(resolve => {
+                if (frame.contentDocument && frame.contentDocument.readyState === 'complete') resolve();
+                else frame.addEventListener('load', resolve, { once: true });
+            });
+            await waitFor(() => q('.excel-table'), 'таблица загрузилась');
+
+            await run('A. Новая таблица → Сохранить → диалог пути → файл в sandbox', async () => {
+                setCell(0, 0, 'Привет');
+                q('#btn-save').click();
+
+                await waitFor(() => q('.modal-input'), 'диалог сохранения');
+                q('.modal-input').value = flowPath;
+                modalButton('Сохранить').click();
+
+                await waitStatus('Сохранено: ' + flowPath);
+                const res = await fetch('/api/files/' + encodeURIComponent(flowPath));
+                assert(res.ok, 'файл не создан: ' + res.status);
+                const data = await res.json();
+                assert(decodeB64(data.content).includes('Привет'), 'значение не попало в JSON');
+            });
+
+            await run('B. Открыть → выбор файла → содержимое в таблице', async () => {
+                q('#btn-open').click();
+                await waitFor(() => q('.modal-tree'), 'дерево в модалке');
+
+                const folder = qa('.modal-tree .tree-toggle').find(t => t.textContent === 'e2e');
+                assert(folder, 'папка e2e не найдена');
+                folder.click();
+
+                const file = qa('.modal-tree .tree-file').find(f => f.dataset.path === flowPath);
+                assert(file, 'файл e2e/flow-a.json не найден');
+                file.click();
+
+                const open = modalButton('Открыть');
+                assert(open.disabled === false, 'кнопка Открыть disabled');
+                open.click();
+
+                await waitStatus('листов:');
+                await waitFor(() => {
+                    const cell = q('td[data-row="0"][data-col="0"]');
+                    return cell && cell.textContent === 'Привет';
+                }, 'значение из файла');
+            });
+
+            await run('C. Правки → Открыть → Удалить → открывается исходный файл', async () => {
+                setCell(0, 0, 'Временное');
+                q('#btn-open').click();
+
+                await waitFor(() => modalButton('Удалить'), 'диалог несохранённых');
+                modalButton('Удалить').click();
+
+                await waitFor(() => q('.modal-tree'), 'дерево после удаления');
+                const folder = qa('.modal-tree .tree-toggle').find(t => t.textContent === 'e2e');
+                if (folder) folder.click();
+                const file = qa('.modal-tree .tree-file').find(f => f.dataset.path === flowPath);
+                assert(file, 'файл не найден во втором диалоге');
+                file.click();
+                modalButton('Открыть').click();
+
+                await waitFor(() => q('td[data-row="0"][data-col="0"]').textContent === 'Привет',
+                    'исходное значение после удаления черновика');
+            });
+
+            await run('D. Черновик восстанавливается после перезагрузки', async () => {
+                setCell(1, 1, 'черновик');
+                await sleep(500); // debounce Draft.save
+
+                frame.contentWindow.location.reload();
+                await new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
+                await waitFor(() => q('.excel-table'), 'таблица после перезагрузки');
+
+                const cell = q('td[data-row="1"][data-col="1"]');
+                assert(cell && cell.textContent === 'черновик', 'черновик не восстановлен');
+                assert(q('#status').textContent.includes('черновик'), 'нет сообщения о черновике');
+
+                localStorage.removeItem('excel-viewer:draft:' + location.origin + '/');
+            });
+
+            await run('E. Загрузить .xlsx → сохранить → шрифты и ширины в JSON', async () => {
+                const buffer = await (await fetch('/sandbox/excel/test.xlsx')).arrayBuffer();
+                const dt = new DataTransfer();
+                dt.items.add(new File([buffer], 'import-test.xlsx', {
+                    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                }));
+
+                const input = q('#file-input');
+                input.files = dt.files;
+                input.dispatchEvent(new frame.contentWindow.Event('change', { bubbles: true }));
+
+                // после выбора файла приложение может спросить о несохранённых правках
+                await sleep(150);
+                const discard = modalButton('Удалить');
+                if (discard) discard.click();
+
+                await waitStatus('Импортирован');
+
+                q('#btn-save').click();
+                await waitFor(() => q('.modal-input'), 'диалог сохранения импорта');
+                q('.modal-input').value = importPath;
+                modalButton('Сохранить').click();
+
+                await waitStatus('Сохранено: ' + importPath);
+                const res = await fetch('/api/files/' + encodeURIComponent(importPath));
+                const data = await res.json();
+                const json = JSON.parse(decodeB64(data.content));
+                const fonts = Object.values(json.sheets[0].fonts || {});
+                assert(fonts.some(f => f.bold), 'bold не сохранён в JSON');
+                assert(Object.keys(json.sheets[0].colWidths || {}).length > 0, 'ширины не сохранены');
+            });
+
+            await run('F. Сохранение по существующему пути требует подтверждения', async () => {
+                frame.contentWindow.location.reload();
+                await new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
+                await waitFor(() => q('.excel-table'), 'таблица после перезагрузки');
+
+                setCell(0, 0, 'Перезапись');
+                q('#btn-save').click();
+
+                await waitFor(() => q('.modal-input'), 'диалог сохранения');
+                q('.modal-input').value = flowPath;
+                modalButton('Сохранить').click();
+
+                await waitFor(() => modalButton('Перезаписать'), 'подтверждение перезаписи');
+                modalButton('Перезаписать').click();
+
+                await waitStatus('Сохранено: ' + flowPath);
+                const res = await fetch('/api/files/' + encodeURIComponent(flowPath));
+                const data = await res.json();
+                assert(decodeB64(data.content).includes('Перезапись'), 'файл не перезаписан');
+            });
+
+            await run('G. Строка команд: ввод, Enter и баннер ошибки', async () => {
+                const input = q('#command-input');
+                assert(input, 'поле команд не найдено');
+
+                input.value = 'A1 = Из команды';
+                input.dispatchEvent(new frame.contentWindow.KeyboardEvent('keydown', {
+                    key: 'Enter', bubbles: true
+                }));
+
+                await waitFor(() => q('td[data-row="0"][data-col="0"]').textContent === 'Из команды',
+                    'команда не применилась');
+                assert(input.value === '', 'поле не очищено после Enter');
+
+                input.value = 'A1 B2 = x';
+                input.dispatchEvent(new frame.contentWindow.KeyboardEvent('keydown', {
+                    key: 'Enter', bubbles: true
+                }));
+
+                const banner = q('#command-error');
+                assert(banner && !banner.hidden, 'баннер ошибки не показан');
+                assert(banner.textContent === 'отсутствует разделитель',
+                    'текст баннера: ' + banner.textContent);
+
+                input.value = 'help';
+                input.dispatchEvent(new frame.contentWindow.KeyboardEvent('keydown', {
+                    key: 'Enter', bubbles: true
+                }));
+
+                const help = await waitFor(() => {
+                    const el = q('#help-banner');
+                    return el && !el.hidden ? el : null;
+                }, 'help-баннер');
+                assert(/union/.test(help.textContent), 'в баннере нет списка команд');
+                assert(/border/.test(help.textContent), 'в баннере нет border');
+
+                help.click();
+                await waitFor(() => q('#help-banner').hidden, 'help-баннер не закрылся по клику');
+            });
+
+            await run('H. Скачать .xlsx из памяти без сохранения', async () => {
+                setCell(0, 0, 'Экспорт');
+                q('#btn-download').click();
+
+                const toast = await waitFor(() => q('.download-toast'), 'ссылка на скачивание');
+                assert(/\.xlsx/.test(toast.textContent), 'текст ссылки: ' + toast.textContent);
+                assert(/\.xlsx$/.test(toast.download), 'download: ' + toast.download);
+                toast.remove();
+            });
+
+            const failed = results.filter(r => !r.ok);
+            document.getElementById('results').textContent = results
+                .map(r => (r.ok ? 'PASS ' : 'FAIL ') + r.name + (r.ok ? '' : ' — ' + r.error))
+                .join('\n') + '\nSUMMARY: ' + (failed.length ? 'FAIL' : 'PASS') +
+                ' (' + (results.length - failed.length) + '/' + results.length + ')';
+            document.body.dataset.status = failed.length ? 'fail' : 'pass';
+        })();
+    </script>
+</body>
+</html>

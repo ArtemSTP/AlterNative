@@ -4,6 +4,47 @@
 (() => {
     const $ = (id) => document.getElementById(id);
 
+    const appEl = $('app');
+    const providerEl = $('provider');
+    const btnTree = $('btn-tree');
+    const treeBackdrop = $('tree-backdrop');
+    const narrowQuery = window.matchMedia('(max-width: 720px)');
+
+    function isNarrow() {
+        return narrowQuery.matches;
+    }
+
+    function setTreeOpen(open) {
+        if (!appEl) return;
+        appEl.dataset.tree = open ? 'open' : 'closed';
+        if (btnTree) {
+            btnTree.setAttribute('aria-expanded', String(open));
+            btnTree.title = open ? 'Скрыть дерево файлов' : 'Показать дерево файлов';
+        }
+        if (treeBackdrop) treeBackdrop.hidden = !(open && isNarrow());
+    }
+
+    function toggleTree() {
+        setTreeOpen(!appEl || appEl.dataset.tree !== 'open');
+    }
+
+    // На телефоне дерево стартует свёрнутым, на десктопе — раскрытым
+    setTreeOpen(!isNarrow());
+
+    if (btnTree) btnTree.addEventListener('click', toggleTree);
+    if (treeBackdrop) treeBackdrop.addEventListener('click', () => setTreeOpen(false));
+
+    const onViewportChange = (event) => setTreeOpen(!event.matches);
+    if (narrowQuery.addEventListener) narrowQuery.addEventListener('change', onViewportChange);
+    else if (narrowQuery.addListener) narrowQuery.addListener(onViewportChange);
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && isNarrow() &&
+            appEl && appEl.dataset.tree === 'open') {
+            setTreeOpen(false);
+        }
+    });
+
     const btnLoad = $('btn-load');
     const btnOpen = $('btn-open');
     const btnSave = $('btn-save');
@@ -72,6 +113,55 @@
         statusEl.className = cls || '';
     }
 
+    const CONNECTION_KEY = 'excel-viewer:connection';
+    const TOKEN_KEY = 'excel-viewer:token';
+
+    function readConnection() {
+        let saved = null;
+        try {
+            saved = JSON.parse(localStorage.getItem(CONNECTION_KEY) || 'null');
+        } catch (e) { /* ignore */ }
+
+        let token = '';
+        try {
+            token = sessionStorage.getItem(TOKEN_KEY) || '';
+        } catch (e) { /* ignore */ }
+
+        return Object.assign({
+            provider: 'github', projectUrl: '', ref: 'main', folder: ''
+        }, saved || {}, { token });
+    }
+
+    function saveConnection(values) {
+        try {
+            localStorage.setItem(CONNECTION_KEY, JSON.stringify({
+                provider: values.provider || 'github',
+                projectUrl: values.projectUrl || '',
+                ref: values.ref || 'main',
+                folder: values.folder || ''
+            }));
+            // Токен — только на время вкладки, в localStorage не кладём
+            if (values.token) sessionStorage.setItem(TOKEN_KEY, values.token);
+            else sessionStorage.removeItem(TOKEN_KEY);
+        } catch (e) { /* ignore */ }
+    }
+
+    function applyConnection(conn) {
+        if (!conn) return;
+        if (providerEl && conn.provider) providerEl.value = conn.provider;
+
+        const url = $('project-url');
+        if (url && conn.projectUrl) url.value = conn.projectUrl;
+        const ref = $('ref');
+        if (ref && conn.ref) ref.value = conn.ref;
+        const folder = $('folder');
+        if (folder && conn.folder !== undefined) folder.value = conn.folder;
+        const token = $('token');
+        if (token && conn.token) token.value = conn.token;
+
+        updateProviderHint();
+    }
+
     function updateButtons() {
         const hasDoc = !!SheetView.getActiveSheet();
         // Новую таблицу можно сохранить, даже если она ещё пустая
@@ -95,11 +185,21 @@
         return items;
     }
 
+    async function refreshTreeQuietly() {
+        try {
+            await Core.reloadTree();
+        } catch (e) {
+            // сохранение уже прошло; дерево обновится при следующем «Загрузить»
+        }
+    }
+
     async function saveToPath(path) {
         if (await Core.pathExists(path)) {
             if (!(await Dialog.confirmOverwrite(path))) return false;
         }
         await Core.saveAs(path);
+        await refreshTreeQuietly();
+        setStatus(`Сохранено: ${path}`, 'saved');
         return true;
     }
 
@@ -111,6 +211,8 @@
             if (!(await saveToPath(path))) return false;
         } else {
             await Core.save();
+            await refreshTreeQuietly();
+            setStatus(`Сохранено: ${Core.getCurrentPath()}`, 'saved');
         }
         Draft.clear();
         updateButtons();
@@ -153,19 +255,12 @@
         updateButtons();
     }
 
-    async function uploadFlow() {
-        try {
-            if (!(await resolveUnsaved())) return;
-            fileInput.value = '';
-            fileInput.click();
-        } catch (e) {
-            setStatus(e.message, 'error');
-        }
-    }
-
     async function boot() {
         const config = await Config.load();
-        const localMode = config.test_local === true;
+        const localMode = Mode.isLocal(config, window.location.hostname);
+
+        const savedConnection = readConnection();
+        applyConnection(savedConnection);
 
         // Справочник операторов для автодополнения (Tab)
         Complete.load();
@@ -173,6 +268,7 @@
         Core.init({
             status: setStatus,
             mode: localMode ? 'local' : 'gitlab',
+            provider: providerEl ? providerEl.value : 'gitlab',
             localUrl: config.local_api
         });
         document.body.classList.toggle('local-mode', localMode);
@@ -192,6 +288,23 @@
         });
 
         SheetView.setWorkbook(SheetView.emptyWorkbook());
+
+        // Восстанавливаем сохранённое подключение до черновика:
+        // loadProject сбрасывает документ, а черновик должен остаться.
+        let connectError = null;
+        if (!localMode && savedConnection.projectUrl && savedConnection.token) {
+            try {
+                await Core.loadProject({
+                    projectUrl: savedConnection.projectUrl,
+                    token: savedConnection.token,
+                    ref: savedConnection.ref || 'main',
+                    folder: savedConnection.folder || '',
+                    provider: savedConnection.provider || (providerEl ? providerEl.value : 'gitlab')
+                });
+            } catch (e) {
+                connectError = e;
+            }
+        }
 
         let draftRestored = false;
         const draft = Draft.load();
@@ -222,6 +335,9 @@
         if (draftRestored) {
             setStatus('Восстановлен несохранённый черновик', 'saving');
         }
+        if (connectError) {
+            setStatus('Не удалось подключиться к репозиторию: ' + connectError.message, 'error');
+        }
     }
 
     TreeView.init($('tree'), async (path) => {
@@ -230,6 +346,7 @@
             await Core.openFile(path);
             Draft.clear();
             updateButtons();
+            if (isNarrow()) setTreeOpen(false);
         } catch (e) {
             setStatus(e.message, 'error');
         }
@@ -242,12 +359,16 @@
                 await Core.reloadTree();
             } else {
                 if (!(await resolveUnsaved())) return;
-                await Core.loadProject({
+
+                const values = {
+                    provider: providerEl ? providerEl.value : 'gitlab',
                     projectUrl: $('project-url').value.trim(),
                     token: $('token').value.trim(),
                     ref: $('ref').value.trim() || 'main',
                     folder: $('folder').value.trim()
-                });
+                };
+                await Core.loadProject(values);
+                saveConnection(values);
                 Draft.clear();
                 updateButtons();
             }
@@ -273,6 +394,7 @@
         try {
             await saveFlow();
         } catch (e) {
+            console.error(e);
             setStatus(e.message, 'error');
         } finally {
             updateButtons();
@@ -280,27 +402,29 @@
     });
 
     btnUpload.addEventListener('click', () => {
-        uploadFlow();
+        // Открываем диалог файла синхронно — Safari теряет user gesture после await
+        fileInput.value = '';
+        fileInput.click();
     });
 
     fileInput.addEventListener('change', async () => {
         const file = fileInput.files && fileInput.files[0];
         if (!file) return;
         try {
+            if (!(await resolveUnsaved())) return;
             await Core.importXlsx(file);
             updateButtons();
         } catch (e) {
             setStatus(e.message, 'error');
+        } finally {
+            fileInput.value = '';
         }
     });
 
     btnDownload.addEventListener('click', async () => {
         btnDownload.disabled = true;
         try {
-            // Сохраняем только если путь ещё не выбран или есть правки
-            if (!Core.getCurrentPath() || SheetView.hasChanges()) {
-                if (!(await saveFlow())) return;
-            }
+            // Экспорт из текущей таблицы: сохранение в репозиторий не требуется
             await Core.exportXlsx();
         } catch (e) {
             setStatus(e.message, 'error');
@@ -339,6 +463,18 @@
             }
         });
     }
+
+    function updateProviderHint() {
+        if (!providerEl) return;
+        const url = $('project-url');
+        if (!url) return;
+        url.placeholder = providerEl.value === 'github'
+            ? 'owner/repo или https://github.com/owner/repo'
+            : 'https://gitlab.example.com/group/project';
+    }
+
+    if (providerEl) providerEl.addEventListener('change', updateProviderHint);
+    updateProviderHint();
 
     window.addEventListener('beforeunload', (e) => {
         if (SheetView.hasChanges()) {
