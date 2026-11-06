@@ -4,6 +4,47 @@
 (() => {
     const $ = (id) => document.getElementById(id);
 
+    const appEl = $('app');
+    const providerEl = $('provider');
+    const btnTree = $('btn-tree');
+    const treeBackdrop = $('tree-backdrop');
+    const narrowQuery = window.matchMedia('(max-width: 720px)');
+
+    function isNarrow() {
+        return narrowQuery.matches;
+    }
+
+    function setTreeOpen(open) {
+        if (!appEl) return;
+        appEl.dataset.tree = open ? 'open' : 'closed';
+        if (btnTree) {
+            btnTree.setAttribute('aria-expanded', String(open));
+            btnTree.title = open ? 'Скрыть дерево файлов' : 'Показать дерево файлов';
+        }
+        if (treeBackdrop) treeBackdrop.hidden = !(open && isNarrow());
+    }
+
+    function toggleTree() {
+        setTreeOpen(!appEl || appEl.dataset.tree !== 'open');
+    }
+
+    // На телефоне дерево стартует свёрнутым, на десктопе — раскрытым
+    setTreeOpen(!isNarrow());
+
+    if (btnTree) btnTree.addEventListener('click', toggleTree);
+    if (treeBackdrop) treeBackdrop.addEventListener('click', () => setTreeOpen(false));
+
+    const onViewportChange = (event) => setTreeOpen(!event.matches);
+    if (narrowQuery.addEventListener) narrowQuery.addEventListener('change', onViewportChange);
+    else if (narrowQuery.addListener) narrowQuery.addListener(onViewportChange);
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && isNarrow() &&
+            appEl && appEl.dataset.tree === 'open') {
+            setTreeOpen(false);
+        }
+    });
+
     const btnLoad = $('btn-load');
     const btnOpen = $('btn-open');
     const btnSave = $('btn-save');
@@ -95,11 +136,21 @@
         return items;
     }
 
+    async function refreshTreeQuietly() {
+        try {
+            await Core.reloadTree();
+        } catch (e) {
+            // сохранение уже прошло; дерево обновится при следующем «Загрузить»
+        }
+    }
+
     async function saveToPath(path) {
         if (await Core.pathExists(path)) {
             if (!(await Dialog.confirmOverwrite(path))) return false;
         }
         await Core.saveAs(path);
+        await refreshTreeQuietly();
+        setStatus(`Сохранено: ${path}`, 'saved');
         return true;
     }
 
@@ -111,6 +162,8 @@
             if (!(await saveToPath(path))) return false;
         } else {
             await Core.save();
+            await refreshTreeQuietly();
+            setStatus(`Сохранено: ${Core.getCurrentPath()}`, 'saved');
         }
         Draft.clear();
         updateButtons();
@@ -153,19 +206,9 @@
         updateButtons();
     }
 
-    async function uploadFlow() {
-        try {
-            if (!(await resolveUnsaved())) return;
-            fileInput.value = '';
-            fileInput.click();
-        } catch (e) {
-            setStatus(e.message, 'error');
-        }
-    }
-
     async function boot() {
         const config = await Config.load();
-        const localMode = config.test_local === true;
+        const localMode = Mode.isLocal(config, window.location.hostname);
 
         // Справочник операторов для автодополнения (Tab)
         Complete.load();
@@ -173,6 +216,7 @@
         Core.init({
             status: setStatus,
             mode: localMode ? 'local' : 'gitlab',
+            provider: providerEl ? providerEl.value : 'gitlab',
             localUrl: config.local_api
         });
         document.body.classList.toggle('local-mode', localMode);
@@ -230,6 +274,7 @@
             await Core.openFile(path);
             Draft.clear();
             updateButtons();
+            if (isNarrow()) setTreeOpen(false);
         } catch (e) {
             setStatus(e.message, 'error');
         }
@@ -246,7 +291,8 @@
                     projectUrl: $('project-url').value.trim(),
                     token: $('token').value.trim(),
                     ref: $('ref').value.trim() || 'main',
-                    folder: $('folder').value.trim()
+                    folder: $('folder').value.trim(),
+                    provider: providerEl ? providerEl.value : 'gitlab'
                 });
                 Draft.clear();
                 updateButtons();
@@ -280,27 +326,29 @@
     });
 
     btnUpload.addEventListener('click', () => {
-        uploadFlow();
+        // Открываем диалог файла синхронно — Safari теряет user gesture после await
+        fileInput.value = '';
+        fileInput.click();
     });
 
     fileInput.addEventListener('change', async () => {
         const file = fileInput.files && fileInput.files[0];
         if (!file) return;
         try {
+            if (!(await resolveUnsaved())) return;
             await Core.importXlsx(file);
             updateButtons();
         } catch (e) {
             setStatus(e.message, 'error');
+        } finally {
+            fileInput.value = '';
         }
     });
 
     btnDownload.addEventListener('click', async () => {
         btnDownload.disabled = true;
         try {
-            // Сохраняем только если путь ещё не выбран или есть правки
-            if (!Core.getCurrentPath() || SheetView.hasChanges()) {
-                if (!(await saveFlow())) return;
-            }
+            // Экспорт из текущей таблицы: сохранение в репозиторий не требуется
             await Core.exportXlsx();
         } catch (e) {
             setStatus(e.message, 'error');
@@ -339,6 +387,18 @@
             }
         });
     }
+
+    function updateProviderHint() {
+        if (!providerEl) return;
+        const url = $('project-url');
+        if (!url) return;
+        url.placeholder = providerEl.value === 'github'
+            ? 'owner/repo или https://github.com/owner/repo'
+            : 'https://gitlab.example.com/group/project';
+    }
+
+    if (providerEl) providerEl.addEventListener('change', updateProviderHint);
+    updateProviderHint();
 
     window.addEventListener('beforeunload', (e) => {
         if (SheetView.hasChanges()) {

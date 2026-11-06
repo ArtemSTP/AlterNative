@@ -174,7 +174,7 @@ const Commands = (() => {
     // ---------- type ----------
 
     function parseTypes(input) {
-        const parts = String(input || '').split(/\s+and\s+/i)
+        const parts = String(input || '').split(/\s*(?:,|\band\b)\s*/i)
             .map(part => part.trim())
             .filter(Boolean);
         if (!parts.length) throw syntaxError();
@@ -554,7 +554,7 @@ const Commands = (() => {
         checkCellCount(ranges);
 
         if (parts[0] === 'null') SheetView.clearBorders(ranges);
-        else if (parts[0] === 'all') SheetView.setBorders(ranges, new Set(SIDES));
+        else if (parts[0] === 'all') SheetView.setBordersAll(ranges);
         else SheetView.setBorders(ranges, new Set(parts));
 
         SheetView.refresh();
@@ -648,7 +648,7 @@ const Commands = (() => {
         SheetView.refresh();
     }
 
-    function execute(line) {
+    function executeOne(line) {
         const text = String(line || '').trim();
         if (!text) throw syntaxError();
 
@@ -674,6 +674,284 @@ const Commands = (() => {
         if (/^union\s/i.test(text)) return execUnion(text);
         if (/^split\s/i.test(text)) return execSplit(text);
         return execAssign(text);
+    }
+
+    // ---------- несколько команд: (…) + (…) ----------
+
+    const ESCAPE_MSG = 'Команда должна быть экранирована "(" или ")"';
+    const SEPARATOR_MSG = 'Отсутствует разделитель "+" между командами';
+    const NO_CELLS_MSG = 'Не указаны ячейки';
+    const FIRST_CELLS_MSG = 'Ячейки обязательно должны быть указаны в первой команде';
+
+    const REF_OPS = ['type', 'color', 'border', 'clear', 'union', 'split'];
+
+    // Похоже ли содержимое на команду, а не на произвольный текст значения
+    function looksLikeCommand(text) {
+        const trimmed = String(text || '').trim();
+        if (/^(type|color|border|clear|new|move|delete|union|split|normalize)\b/i.test(trimmed)) {
+            return true;
+        }
+        return trimmed.indexOf('=') !== -1 &&
+            /^[A-Za-z\u0410-\u044F\u0401\u0451]+\s*\d*\b/.test(trimmed);
+    }
+
+    function groupLooksLikeCommand(text) {
+        const trimmed = text.trim();
+        if (trimmed.charAt(0) !== '(') return false;
+
+        let depth = 0;
+        for (let i = 0; i < trimmed.length; i++) {
+            if (trimmed[i] === '(') depth++;
+            else if (trimmed[i] === ')' && --depth === 0) {
+                return looksLikeCommand(trimmed.slice(1, i));
+            }
+        }
+        return false;
+    }
+
+    // Строка — цепочка команд, только если есть экранирование и/или «+» у групп.
+    // Иначе «A1 = текст (с пояснением)» остаётся обычным присваиванием.
+    function isStructured(text) {
+        const trimmed = text.trim();
+        if (trimmed.charAt(0) === '(') return true;
+        if (trimmed.indexOf('+') === -1) return false;
+
+        const operator = /^(type|color|border|clear|new|move|delete|union|split|normalize)\b/i;
+        const parts = trimmed.split('+');
+
+        for (let i = 1; i < parts.length; i++) {
+            const part = parts[i].trim();
+            if (operator.test(part)) return true;
+            if (part.charAt(0) === '(' && groupLooksLikeCommand(part)) return true;
+        }
+
+        // Группа перед «+» в значении: A1 = x+(color = red)+...
+        const before = /\(([^()]*)\)\s*\+/.exec(trimmed);
+        return !!before && looksLikeCommand(before[1]);
+    }
+
+    function matchingParen(text, open) {
+        let depth = 0;
+        for (let i = open; i < text.length; i++) {
+            if (text[i] === '(') depth++;
+            else if (text[i] === ')' && --depth === 0) return i;
+        }
+        return -1;
+    }
+
+    function parseLevel(text, start, depth, state) {
+        const elements = [];
+        let index = start;
+
+        while (index < text.length) {
+            index = skipSpaces(text, index);
+            if (index >= text.length) break;
+
+            if (text[index] === ')') {
+                if (depth === 0) {
+                    state.unescaped = true;
+                    index++;
+                    continue;
+                }
+                return { elements, next: index + 1 };
+            }
+
+            if (text[index] === '(') {
+                const inner = parseLevel(text, index + 1, depth + 1, state);
+                elements.push({ type: 'group', elements: inner.elements });
+                index = skipSpaces(text, inner.next);
+                if (index < text.length && text[index] !== '+' && text[index] !== ')') {
+                    if (text[index] === '(') state.separator = true;
+                    else state.unescaped = true;
+                }
+                continue;
+            }
+
+            const from = index;
+            while (index < text.length && text[index] !== '+' && text[index] !== ')') {
+                if (text[index] === '(') {
+                    // Скобка в середине команды — часть значения,
+                    // например: (A1 = текст (пояснение))+(color = red)
+                    const close = matchingParen(text, index);
+                    index = close === -1 ? index + 1 : close + 1;
+                    continue;
+                }
+                index++;
+            }
+            const bare = text.slice(from, index).trim();
+            if (bare) elements.push({ type: 'command', text: bare });
+
+            index = skipSpaces(text, index);
+            if (text[index] === '+') index++;
+        }
+
+        // Незакрытая скобка
+        if (depth > 0) state.unescaped = true;
+
+        return { elements, next: index };
+    }
+
+    function validateLevels(elements) {
+        if (!elements.length) throw syntaxError();
+        if (elements.length > 1 && elements.some(element => element.type === 'command')) {
+            throw new Error(ESCAPE_MSG);
+        }
+        for (const element of elements) {
+            if (element.type === 'group') validateLevels(element.elements);
+        }
+    }
+
+    // Оператор команды и его ссылки (до «=»). null — ссылок нет.
+    function commandInfo(text) {
+        const match = /^\s*[A-Za-z\u0410-\u044F\u0401\u0451]+/.exec(text);
+        const word = match ? match[0].trim().toLowerCase() : '';
+        const known = ['type', 'color', 'border', 'clear', 'new', 'move', 'delete',
+            'union', 'split', 'normalize'];
+        const kind = known.indexOf(word) !== -1 ? word : 'other';
+
+        if (kind === 'color' || kind === 'border' || kind === 'type') {
+            const eq = text.indexOf('=');
+            const headEnd = eq === -1 ? text.length : eq;
+            const head = text.slice(match ? match[0].length : 0, headEnd).trim();
+            return { kind, refs: head || null };
+        }
+        if (kind === 'clear' || kind === 'union' || kind === 'split') {
+            const head = text.slice(match ? match[0].length : 0).trim();
+            return { kind, refs: head || null };
+        }
+        if (kind === 'other') {
+            // width/height/size — не присваивание
+            const dim = DIM_RE.exec(text);
+            if (dim && dim[1].indexOf('=') === -1) return { kind: 'dim', refs: null };
+
+            const eq = text.indexOf('=');
+            if (eq > 0) return { kind: 'assign', refs: text.slice(0, eq).trim() || null };
+        }
+        return { kind, refs: null };
+    }
+
+    function providesRefs(info) {
+        return !!info.refs && (REF_OPS.indexOf(info.kind) !== -1 || info.kind === 'assign');
+    }
+
+    // Подставить унаследованные ячейки: «color = green» → «color A1, B1 = green»
+    function withInheritedRefs(text, refs) {
+        const match = /^\s*[A-Za-z\u0410-\u044F\u0401\u0451]+/.exec(text);
+        if (!match) return text;
+        return text.slice(0, match[0].length) + ' ' + refs + text.slice(match[0].length);
+    }
+
+    function rangesToText(ranges) {
+        return ranges.map(rg => {
+            const first = indexToCol(rg.c0 + 1) + (rg.r0 + 1);
+            if (rg.r0 === rg.r1 && rg.c0 === rg.c1) return first;
+            return first + ' -> ' + indexToCol(rg.c1 + 1) + (rg.r1 + 1);
+        }).join(', ');
+    }
+
+    function refsToRanges(kind, refs) {
+        if (!refs) return [];
+        try {
+            // color/border понимают строки и столбцы, остальные — только ячейки
+            if (kind === 'color' || kind === 'border') return parseRefAreas(refs);
+            return parseRefList(refs);
+        } catch (e) {
+            return []; // сообщит сама команда
+        }
+    }
+
+    // Есть ли в элементе явно указанные ячейки (рекурсивно для групп)
+    function hasExplicitRefs(element) {
+        if (element.type === 'command') return providesRefs(commandInfo(element.text));
+        return element.elements.some(hasExplicitRefs);
+    }
+
+    function countExplicitRefs(elements) {
+        return elements.reduce((total, element) => total + (element.type === 'command'
+            ? (hasExplicitRefs(element) ? 1 : 0)
+            : countExplicitRefs(element.elements)), 0);
+    }
+
+    // Проверка до выполнения: первая команда с ячейками должна их указать.
+    // state.seen/total — чтобы отличить «ячеек нет нигде» от «указаны позже».
+    function validateLevel(elements, refsAvailable, state) {
+        let available = !!refsAvailable;
+
+        for (const element of elements) {
+            if (element.type === 'group') {
+                validateLevel(element.elements, available, state);
+                if (hasExplicitRefs(element)) available = true;
+                continue;
+            }
+
+            const info = commandInfo(element.text);
+            if (providesRefs(info)) {
+                state.seen++;
+                available = true;
+                continue;
+            }
+            if (REF_OPS.indexOf(info.kind) === -1) continue;
+            if (available) continue;
+
+            throw new Error(state.seen < state.total ? FIRST_CELLS_MSG : NO_CELLS_MSG);
+        }
+    }
+
+    // Выполнение уровня; inheritedRefs — ячейки, унаследованные от родителя.
+    // Порядок: вложенные группы выполняются по мере обхода, ячейки
+    // наследуются от ближайшей команды/группы, где они указаны.
+    function executeLevel(elements, inheritedRefs) {
+        let currentRefs = inheritedRefs || null;
+        const touched = [];
+
+        for (const element of elements) {
+            if (element.type === 'group') {
+                const result = executeLevel(element.elements, currentRefs);
+                touched.push(...result.ranges);
+                if (result.ranges.length) currentRefs = rangesToText(result.ranges);
+                continue;
+            }
+
+            const info = commandInfo(element.text);
+            if (REF_OPS.indexOf(info.kind) !== -1) {
+                const refs = info.refs || currentRefs;
+                if (!refs) throw new Error(NO_CELLS_MSG); // страховка
+
+                const line = info.refs ? element.text : withInheritedRefs(element.text, refs);
+                executeOne(line);
+                if (info.refs) currentRefs = info.refs;
+                touched.push(...refsToRanges(info.kind, refs));
+            } else {
+                executeOne(element.text);
+                if (info.kind === 'assign' && info.refs) {
+                    currentRefs = info.refs;
+                    touched.push(...refsToRanges(info.kind, info.refs));
+                }
+            }
+        }
+
+        return { ranges: touched };
+    }
+
+    function execute(line) {
+        const text = String(line || '').trim();
+        if (!text) throw syntaxError();
+
+        if (!isStructured(text)) {
+            const elements = [{ type: 'command', text }];
+            validateLevel(elements, false, { seen: 0, total: countExplicitRefs(elements) });
+            return executeLevel(elements);
+        }
+
+        const state = { unescaped: false, separator: false };
+        const root = parseLevel(text, 0, 0, state);
+        // Приоритет: ошибка экранирования важнее ошибки разделителя.
+        if (state.unescaped) throw new Error(ESCAPE_MSG);
+        if (state.separator) throw new Error(SEPARATOR_MSG);
+
+        validateLevels(root.elements);
+        validateLevel(root.elements, false, { seen: 0, total: countExplicitRefs(root.elements) });
+        return executeLevel(root.elements);
     }
 
     return { execute, parseRefList, colToIndex, indexToCol };

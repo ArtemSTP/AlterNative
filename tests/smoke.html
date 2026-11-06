@@ -1,0 +1,1408 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Smoke test</title>
+</head>
+<body>
+    <pre id="results"></pre>
+    <div id="tree"></div>
+    <div id="sheet-tabs"></div>
+    <div id="table-container"></div>
+
+    <script src="../vendor/exceljs.min.js"></script>
+    <script src="../js/config.js"></script>
+    <script src="../js/mode.js"></script>
+    <script src="../js/api.js"></script>
+    <script src="../js/github-api.js"></script>
+    <script src="../js/local-api.js"></script>
+    <script src="../js/converter.js"></script>
+    <script src="../js/tree.js"></script>
+    <script src="../js/view.js"></script>
+    <script src="../js/dialog.js"></script>
+    <script src="../js/draft.js"></script>
+    <script src="../js/commands.js"></script>
+    <script src="../js/complete.js"></script>
+    <script src="../js/core.js"></script>
+    <script>
+        const results = [];
+        const REAL_FETCH = window.fetch.bind(window);
+        function assert(cond, msg) {
+            if (!cond) throw new Error(msg || 'assertion failed');
+        }
+        async function check(name, fn) {
+            try {
+                const r = await fn();
+                if (r === false) throw new Error('assertion returned false');
+                results.push({ name, ok: true });
+            } catch (e) {
+                results.push({ name, ok: false, error: e.message });
+            }
+        }
+
+        function b64utf8(s) {
+            const bytes = new TextEncoder().encode(s);
+            let binary = '';
+            bytes.forEach(b => { binary += String.fromCharCode(b); });
+            return btoa(binary);
+        }
+
+        function unb64utf8(s) {
+            const bytes = Uint8Array.from(atob(s), c => c.charCodeAt(0));
+            return new TextDecoder('utf-8').decode(bytes);
+        }
+
+        function stubFetch(handler, log) {
+            window.fetch = async (url, opts = {}) => {
+                const method = (opts.method || 'GET').toUpperCase();
+                if (log) log.push({ url: String(url), method, body: opts.body });
+                return handler(String(url), method, opts);
+            };
+        }
+
+        function jsonResponse(obj, status = 200, headers = {}) {
+            return new Response(JSON.stringify(obj), {
+                status,
+                headers: Object.assign({ 'Content-Type': 'application/json' }, headers)
+            });
+        }
+
+        const SAMPLE = JSON.stringify({
+            sheets: [
+                {
+                    name: 'Данные',
+                    data: [['Товар', 'Цена'], ['Яблоко', '100']],
+                    fonts: { '0:0': { bold: true } },
+                    colWidths: { '1': 16.5, '2': 11 }
+                },
+                { name: 'Лист2', data: [['x', 'y'], ['1', '2']] }
+            ]
+        }, null, 2);
+
+        (async () => {
+            // --- Config ---
+            await check('Config.parse: читает YAML-пары и флаги', () => {
+                const cfg = Config.parse('# comment\ntest_local: true\nlocal_api: "http://127.0.0.1:8787"\n');
+                assert(cfg.test_local === true, 'test_local не распознан');
+                assert(cfg.local_api === 'http://127.0.0.1:8787', 'local_api не распознан');
+            });
+
+            // --- Converter.parse ---
+            await check('Mode.isLocal: только loopback при test_local=true', () => {
+                assert(Mode.isLocal({ test_local: true }, '127.0.0.1'), '127.0.0.1');
+                assert(Mode.isLocal({ test_local: true }, 'localhost'), 'localhost');
+                assert(Mode.isLocal({ test_local: true }, '::1'), '::1');
+                assert(Mode.isLocal({ test_local: true }, '[::1]'), '[::1]');
+                assert(Mode.isLocal({ test_local: true }, 'LOCALHOST'), 'регистр');
+                assert(!Mode.isLocal({ test_local: true }, 'user.github.io'), 'github.io');
+                assert(!Mode.isLocal({ test_local: true }, '192.168.1.5'), 'LAN');
+                assert(!Mode.isLocal({ test_local: false }, '127.0.0.1'), 'test_local=false');
+                assert(!Mode.isLocal(null, '127.0.0.1'), 'нет конфига');
+            });
+
+            await check('Converter.parse: валидный JSON', () => {
+                const obj = Converter.parse('{"sheets":[{"name":"S1","data":[["a","b"]]}]}');
+                assert(obj.sheets.length === 1, 'ожидался 1 лист');
+                assert(obj.sheets[0].data[0][1] === 'b', 'значение ячейки');
+                assert(obj.sheets[0].fonts, 'fonts должны быть по умолчанию');
+            });
+
+            await check('Converter.parse: отвергает чужой формат', () => {
+                let threw = false;
+                try { Converter.parse('{"foo":1}'); } catch (e) { threw = true; }
+                assert(threw, 'должно было бросить исключение');
+            });
+
+            // --- ExcelJS round-trip ---
+            await check('Converter: xlsx → json → xlsx с кириллицей, bold и ширинами', async () => {
+                const wb = new ExcelJS.Workbook();
+                const ws1 = wb.addWorksheet('Данные');
+                ws1.addRow(['Товар', 'Цена']);
+                ws1.addRow(['Яблоко', '100']);
+                ws1.getCell('A1').font = { bold: true };
+                ws1.getColumn(1).width = 18.5;
+
+                const buffer = await wb.xlsx.writeBuffer();
+                const parsed = Converter.parse(await Converter.xlsxToJson(buffer));
+
+                assert(parsed.sheets[0].name === 'Данные', 'имя листа');
+                assert(parsed.sheets[0].data[1][0] === 'Яблоко', 'кириллица');
+                assert(parsed.sheets[0].fonts['0:0'].bold === true, 'bold не сохранён');
+                assert(Math.abs(parsed.sheets[0].colWidths['1'] - 18.5) < 0.01, 'ширина не сохранена');
+
+                const back = await Converter.jsonToXlsx(parsed);
+                const recheck = new ExcelJS.Workbook();
+                await recheck.xlsx.load(back);
+                const ws2 = recheck.getWorksheet('Данные');
+                assert(ws2.getCell('A1').font.bold === true, 'bold не восстановлен');
+                assert(Math.abs(ws2.getColumn(1).width - 18.5) < 0.15,
+                    'ширина не восстановлена: ' + ws2.getColumn(1).width);
+            });
+
+            await check('Converter: реальный sandbox/excel/test.xlsx', async () => {
+                const res = await fetch('../sandbox/excel/test.xlsx');
+                assert(res.ok, 'не удалось загрузить test.xlsx: ' + res.status);
+                const parsed = Converter.parse(await Converter.xlsxToJson(await res.arrayBuffer()));
+
+                const hasBold = parsed.sheets.some(s =>
+                    Object.values(s.fonts || {}).some(f => f.bold));
+                const hasWidths = parsed.sheets.some(s => Object.keys(s.colWidths || {}).length > 0);
+                assert(hasBold, 'в test.xlsx не найден bold');
+                assert(hasWidths, 'в test.xlsx не найдены ширины столбцов');
+            });
+
+            await check('Converter: фон fill и merges через xlsx', async () => {
+                const json = {
+                    sheets: [{
+                        name: 'Style',
+                        data: [['a', 'b'], ['c', 'd']],
+                        fonts: { '0:0': { fill: 'FF0000' } },
+                        merges: [{ r0: 1, c0: 0, r1: 1, c1: 1 }]
+                    }]
+                };
+                const buffer = await Converter.jsonToXlsx(json);
+                const parsed = Converter.parse(await Converter.xlsxToJson(buffer));
+
+                assert(parsed.sheets[0].fonts['0:0'].fill === 'FF0000', 'fill потерян');
+                const merges = parsed.sheets[0].merges || [];
+                assert(merges.length === 1 && merges[0].r0 === 1 && merges[0].c1 === 1,
+                    'merges потеряны: ' + JSON.stringify(merges));
+            });
+
+            await check('Converter: рамки thin через xlsx', async () => {
+                const json = { sheets: [{ name: 'B', data: [['x']], borders: { '0:0': { up: 1, right: 1 } } }] };
+                const parsed = Converter.parse(await Converter.xlsxToJson(await Converter.jsonToXlsx(json)));
+                const b = (parsed.sheets[0].borders || {})['0:0'];
+                assert(b && b.up && b.right && !b.down && !b.left, JSON.stringify(b));
+            });
+
+            await check('Converter: периметр union переживает xlsx-экспорт', async () => {
+                const json = {
+                    sheets: [{
+                        name: 'M',
+                        data: [['a', 'b'], ['c', 'd']],
+                        merges: [{ r0: 0, c0: 0, r1: 1, c1: 1 }],
+                        borders: {
+                            '0:0': { up: 1, left: 1 },
+                            '0:1': { up: 1, right: 1 },
+                            '1:0': { down: 1, left: 1 },
+                            '1:1': { down: 1, right: 1 }
+                        }
+                    }]
+                };
+                const parsed = Converter.parse(await Converter.xlsxToJson(await Converter.jsonToXlsx(json)));
+                const b = (parsed.sheets[0].borders || {})['0:0'];
+                assert(b && b.up && b.down && b.left && b.right,
+                    'мастер-ячейка без периметра: ' + JSON.stringify(b));
+            });
+
+            await check('Converter: высота строк в xlsx, zoom не экспортируется', async () => {
+                const json = { sheets: [{ name: 'H', data: [['x']], rowHeights: { '1': 40 }, zoom: 2 }] };
+                const parsed = Converter.parse(await Converter.xlsxToJson(await Converter.jsonToXlsx(json)));
+                const h = Number((parsed.sheets[0].rowHeights || {})['1']);
+                assert(Math.abs(h - 40) <= 1, 'высота: ' + h);
+                assert(!parsed.sheets[0].zoom, 'zoom не должен ехать в xlsx');
+            });
+
+            // --- GitLab API ---
+            await check('GitLabAPI.init: разбирает URL проекта', () => {
+                GitLabAPI.init('https://gitlab.example.com/group/sub/project/', 'tok', 'dev');
+                assert(GitLabAPI.isInitialized(), 'адаптер должен быть инициализирован');
+                assert(GitLabAPI.ref === 'dev', 'ref должен сохраниться');
+            });
+
+            await check('GitLabAPI.getTree: обходит пагинацию', async () => {
+                const log = [];
+                stubFetch((url) => {
+                    const page = new URL(url).searchParams.get('page');
+                    if (page === '1') {
+                        return jsonResponse([{ name: 'a.json', path: 'a.json', type: 'blob' }],
+                            200, { 'X-Next-Page': '2' });
+                    }
+                    return jsonResponse([{ name: 'b.json', path: 'b.json', type: 'blob' }], 200);
+                }, log);
+
+                const items = await GitLabAPI.getTree('');
+                assert(items.length === 2, 'ожидалось 2 элемента');
+                assert(log.length === 2, 'ожидалось 2 запроса');
+            });
+
+            await check('GitLabAPI.readFile: base64 → UTF-8 и last_commit_id', async () => {
+                stubFetch(() => jsonResponse({ content: b64utf8(SAMPLE), last_commit_id: 'cmp-1' }));
+                const file = await GitLabAPI.readFile('data/a.json');
+                assert(file.lastCommitId === 'cmp-1', 'last_commit_id не получен');
+                assert(file.content.includes('Яблоко'), 'кириллица декодирована неверно');
+            });
+
+            await check('GitLabAPI.saveFile: передаёт last_commit_id', async () => {
+                const log = [];
+                stubFetch(() => jsonResponse({ file_path: 'data/a.json' }), log);
+                await GitLabAPI.saveFile('data/a.json', '{}', 'msg', 'cmp-1', false);
+                assert(log[0].method === 'PUT', 'ожидался PUT');
+                assert(JSON.parse(log[0].body).last_commit_id === 'cmp-1', 'id не передан');
+            });
+
+            await check('GitLabAPI.saveFile: 400 про конфликт → конфликт', async () => {
+                stubFetch(() => jsonResponse({
+                    message: 'You are attempting to update a file that has changed since you started editing it.'
+                }, 400));
+                let err = null;
+                try { await GitLabAPI.saveFile('data/a.json', '{}', 'msg', 'old', false); }
+                catch (e) { err = e; }
+                assert(err && err.conflict, 'ожидалась ошибка конфликта');
+            });
+
+            await check('GitLabAPI.saveFile: 400 по другой причине → не конфликт', async () => {
+                stubFetch(() => jsonResponse({ message: 'Branch not found' }, 400));
+                let err = null;
+                try { await GitLabAPI.saveFile('data/a.json', '{}', 'msg', null, true); }
+                catch (e) { err = e; }
+                assert(err && !err.conflict, 'не должно быть конфликта');
+                assert(/Branch not found/.test(err.message), 'текст ошибки потерян');
+            });
+
+            // --- LocalAPI ---
+            await check('LocalAPI: дерево, чтение и сохранение', async () => {
+                LocalAPI.init('http://127.0.0.1:8787');
+                const log = [];
+                stubFetch((url, method) => {
+                    if (url.includes('/api/tree')) {
+                        return jsonResponse([{ name: 'a.json', path: 'a.json', type: 'blob' }]);
+                    }
+                    if (method === 'GET') {
+                        return jsonResponse({ content: b64utf8(SAMPLE), last_commit_id: 'h1' });
+                    }
+                    return jsonResponse({ file_path: 'demo/a.json' });
+                }, log);
+
+                const items = await LocalAPI.getTree('');
+                assert(items.length === 1, 'дерево не получено');
+                const file = await LocalAPI.readFile('demo/a.json');
+                assert(file.content.includes('Яблоко') && file.lastCommitId === 'h1', 'чтение неверно');
+
+                await LocalAPI.saveFile('demo/a.json', '{}', '', 'h1', false);
+                const put = log.find(r => r.method === 'PUT');
+                assert(put && JSON.parse(put.body).last_commit_id === 'h1', 'PUT неверен');
+
+                await LocalAPI.saveFile('demo/new.json', '{}', '', null, true);
+                assert(log.some(r => r.method === 'POST'), 'создание должно идти через POST');
+            });
+
+            // --- GitHub API ---
+            await check('GitHubAPI.init: owner/repo и URL', () => {
+                GitHubAPI.init('https://github.com/owner/repo', 'tok', 'dev');
+                assert(GitHubAPI.isInitialized(), 'не инициализирован');
+                assert(GitHubAPI.owner === 'owner' && GitHubAPI.repo === 'repo', 'owner/repo');
+                assert(GitHubAPI.ref === 'dev', 'ref');
+
+                GitHubAPI.init('owner/repo', 'tok');
+                assert(GitHubAPI.isInitialized() && GitHubAPI.ref === 'main', 'короткая форма');
+
+                let err = null;
+                try { GitHubAPI.init('owner', 'tok'); } catch (e) { err = e; }
+                assert(err && /owner\/repo|репозиторий/i.test(err.message),
+                    'ошибка формата: ' + (err && err.message));
+            });
+
+            await check('GitHubAPI.getTree: папка и фильтр JSON', async () => {
+                GitHubAPI.init('owner/repo', 'tok', 'dev');
+                const log = [];
+                stubFetch(() => jsonResponse({
+                    tree: [
+                        { path: 'data', type: 'tree' },
+                        { path: 'data/a.json', type: 'blob' },
+                        { path: 'data/img.png', type: 'blob' },
+                        { path: 'readme.md', type: 'blob' },
+                        { path: 'other/b.json', type: 'blob' }
+                    ]
+                }), log);
+
+                const items = await GitHubAPI.getTree('data');
+                const paths = items.map(i => i.path).sort();
+                assert(paths.join(',') === 'data,data/a.json', 'элементы: ' + paths.join(','));
+                assert(log[0].url.includes('/repos/owner/repo/git/trees/dev?recursive=1'),
+                    'URL: ' + log[0].url);
+            });
+
+            await check('GitHubAPI.readFile: base64 → UTF-8 и sha', async () => {
+                GitHubAPI.init('owner/repo', 'tok', 'main');
+                stubFetch(() => jsonResponse({ content: b64utf8(SAMPLE), sha: 'blob-sha' }));
+                const file = await GitHubAPI.readFile('data/a.json');
+                assert(file.lastCommitId === 'blob-sha', 'sha');
+                assert(file.content.includes('Яблоко'), 'кириллица');
+            });
+
+            await check('GitHubAPI.saveFile: PUT с sha и base64', async () => {
+                GitHubAPI.init('owner/repo', 'tok', 'dev');
+                const log = [];
+                stubFetch(() => jsonResponse({ content: { sha: 'new' } }), log);
+                await GitHubAPI.saveFile('data/a.json', SAMPLE, 'msg', 'old-sha', false);
+
+                assert(log[0].method === 'PUT', 'метод');
+                const body = JSON.parse(log[0].body);
+                assert(body.sha === 'old-sha' && body.branch === 'dev', 'sha/branch');
+                assert(unb64utf8(body.content) === SAMPLE, 'содержимое base64');
+            });
+
+            await check('GitHubAPI.saveFile: конфликт и создание без sha', async () => {
+                GitHubAPI.init('owner/repo', 'tok', 'main');
+                stubFetch(() => jsonResponse({ message: 'sha does not match' }, 409));
+                let err = null;
+                try { await GitHubAPI.saveFile('a.json', '{}', 'm', 'old', false); } catch (e) { err = e; }
+                assert(err && err.conflict, 'нет конфликта: ' + (err && err.message));
+
+                const log = [];
+                stubFetch(() => jsonResponse({}), log);
+                await GitHubAPI.saveFile('a.json', '{}', 'm', null, true);
+                assert(!JSON.parse(log[0].body).sha, 'sha не должен передаваться при создании');
+            });
+
+            await check('Core + GitHub: загрузка проекта, открытие и сохранение', async () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                TreeView.init(document.getElementById('tree'), () => {});
+                Core.init({ status: () => {}, mode: 'gitlab', provider: 'github' });
+
+                const log = [];
+                let sha = 'sha-1';
+                stubFetch((url, method) => {
+                    if (url.includes('/git/trees/')) {
+                        return jsonResponse({
+                            tree: [
+                                { path: 'data', type: 'tree' },
+                                { path: 'data/a.json', type: 'blob' }
+                            ]
+                        });
+                    }
+                    if (method === 'GET' && url.includes('/contents/')) {
+                        return jsonResponse({ content: b64utf8(SAMPLE), sha });
+                    }
+                    if (method === 'PUT') {
+                        sha = 'sha-2';
+                        return jsonResponse({ content: { sha } });
+                    }
+                    throw new Error('неожиданный запрос ' + method + ' ' + url);
+                }, log);
+
+                await Core.loadProject({
+                    projectUrl: 'owner/repo',
+                    token: 'tok',
+                    ref: 'main',
+                    folder: 'data',
+                    provider: 'github'
+                });
+                assert(Core.getMode() === 'github', 'режим: ' + Core.getMode());
+                assert(document.querySelectorAll('#tree .tree-file').length === 1, 'дерево не отрисовано');
+
+                await Core.openFile('data/a.json');
+                assert(Core.getCurrentPath() === 'data/a.json', 'путь не установлен');
+                assert(SheetView.getCellValue(1, 0) === 'Яблоко', 'данные: ' + SheetView.getCellValue(1, 0));
+
+                SheetView.setCellValue(1, 0, 'Груша');
+                await Core.save();
+
+                const put = log.find(r => r.method === 'PUT');
+                assert(put, 'PUT не отправлен');
+                const body = JSON.parse(put.body);
+                assert(body.sha === 'sha-1', 'sha: ' + body.sha);
+                assert(unb64utf8(body.content).includes('Груша'), 'правка не попала в коммит');
+            });
+
+            // --- TreeView ---
+            await check('TreeView.render: вложенное дерево и клик', () => {
+                let selected = null;
+                const el = document.getElementById('tree');
+                TreeView.init(el, p => { selected = p; });
+                TreeView.render([
+                    { name: 'data', path: 'data', type: 'tree' },
+                    { name: 'a.json', path: 'data/a.json', type: 'blob' },
+                    { name: 'readme.md', path: 'readme.md', type: 'blob' },
+                    { name: 'sub', path: 'data/sub', type: 'tree' },
+                    { name: 'b.json', path: 'data/sub/b.json', type: 'blob' }
+                ]);
+                const files = el.querySelectorAll('.tree-file');
+                assert(files.length === 2, 'должно быть 2 json-файла, найдено ' + files.length);
+                assert(!el.textContent.includes('readme.md'), 'не-json файл попал в дерево');
+                const target = Array.from(files).find(f => f.dataset.path === 'data/a.json');
+                target.click();
+                assert(selected === 'data/a.json', 'callback получил ' + selected);
+            });
+
+            // --- SheetView: сетка 10×50 ---
+            await check('SheetView: по умолчанию 10 столбцов и 50 строк', () => {
+                SheetView.init(
+                    document.getElementById('sheet-tabs'),
+                    document.getElementById('table-container'),
+                    () => {}
+                );
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+
+                const headCells = document.querySelectorAll('.excel-table thead th');
+                assert(headCells.length === 11, 'ожидалось 11 заголовков (угловой + 10), найдено ' + headCells.length);
+                assert(headCells[1].textContent === 'A', 'первый столбец A');
+                assert(headCells[10].textContent === 'J', 'десятый столбец J');
+
+                const dataRows = document.querySelectorAll('.excel-table tbody tr');
+                assert(dataRows.length === 50, 'ожидалось 50 строк данных, найдено ' + dataRows.length);
+                assert(dataRows[0].querySelector('.row-header').textContent === '1', 'нумерация с 1');
+                assert(dataRows[49].querySelector('.row-header').textContent === '50', 'последняя строка 50');
+
+                const rowHeaders = document.querySelectorAll('.excel-table tbody th.row-header');
+                assert([...rowHeaders].every(th => th.contentEditable !== 'true'),
+                    'заголовки строк должны быть нередактируемыми');
+                const corner = document.querySelector('.excel-table thead th');
+                assert(corner.contentEditable !== 'true', 'угловая ячейка нередактируема');
+            });
+
+            await check('Commands: A1 = текст, регистр и пробелы', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('  a1   =   Название сервиса  ');
+                assert(SheetView.getCellValue(0, 0) === 'Название сервиса', 'значение не записано');
+                assert(document.querySelector('td[data-row="0"][data-col="0"]').textContent === 'Название сервиса',
+                    'таблица не обновилась');
+            });
+
+            await check('Commands: список через запятую и диапазон через ->', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('A1, B2 = список');
+                assert(SheetView.getCellValue(0, 0) === 'список' && SheetView.getCellValue(1, 1) === 'список',
+                    'список не применён');
+
+                Commands.execute('A1 -> B2 = диапазон');
+                assert(SheetView.getCellValue(0, 0) === 'диапазон', 'A1');
+                assert(SheetView.getCellValue(0, 1) === 'диапазон', 'B1');
+                assert(SheetView.getCellValue(1, 0) === 'диапазон', 'A2');
+                assert(SheetView.getCellValue(1, 1) === 'диапазон', 'B2');
+            });
+
+            await check('Commands: ошибки синтаксиса и разделителя', () => {
+                let err = null;
+                try { Commands.execute('A1 B2 = текст'); } catch (e) { err = e; }
+                assert(err && err.message === 'отсутствует разделитель', 'получено: ' + (err && err.message));
+
+                err = null;
+                try { Commands.execute('просто текст'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса', 'получено: ' + (err && err.message));
+
+                err = null;
+                try { Commands.execute('A1 -> Z5000 = слишком много'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса',
+                    'большой диапазон должен отклоняться, получено: ' + (err && err.message));
+            });
+
+            await check('Commands: type с and и взаимоисключающими типами', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('type A1 = B and I');
+                let font = SheetView.getCellFont(0, 0);
+                assert(font.bold && font.italic, 'B и I не применились');
+                assert(document.querySelector('td[data-row="0"][data-col="0"]').style.fontWeight === '700',
+                    'жирность не отображена');
+
+                Commands.execute('type A2 = _ and url');
+                font = SheetView.getCellFont(1, 0);
+                assert(font.underline && font.url, '_ и url не применились');
+
+                let err = null;
+                try { Commands.execute('type A1 = B and D'); } catch (e) { err = e; }
+                assert(err && err.message === 'взаимоисключающие типы', 'получено: ' + (err && err.message));
+            });
+
+            await check('Commands: new column/row и between', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('D1 = старый D');
+
+                Commands.execute('new column between C and D');
+                let grid = SheetView.getGrid();
+                assert(grid.cols === 11, 'столбцов: ' + grid.cols);
+                assert(SheetView.getCellValue(0, 4) === 'старый D', 'старый D не сдвинулся в E');
+                assert(SheetView.getCellValue(0, 3) === '', 'новый столбец D не пустой');
+
+                Commands.execute('A5 = строка 5');
+                Commands.execute('new row between 3 and 5');
+                grid = SheetView.getGrid();
+                assert(grid.rows === 51, 'строк: ' + grid.rows);
+                assert(SheetView.getCellValue(5, 0) === 'строка 5', 'старая строка 5 не сдвинулась');
+                assert(SheetView.getCellValue(4, 0) === '', 'новая строка 5 не пустая');
+            });
+
+            await check('Commands: new column в конец и буквы после Z', () => {
+                const wb = SheetView.emptyWorkbook();
+                wb.sheets[0].cols = 26;
+                SheetView.setWorkbook(wb);
+
+                Commands.execute('new column');
+                assert(SheetView.getGrid().cols === 27, 'столбцов: ' + SheetView.getGrid().cols);
+                const heads = document.querySelectorAll('.excel-table thead th');
+                assert(heads[27].textContent === 'AA', 'новый столбец ' + heads[27].textContent);
+            });
+
+            await check('Commands: move between, to start, to end', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('A1 = A');
+                Commands.execute('B1 = B');
+                Commands.execute('C1 = C');
+                Commands.execute('D1 = D');
+                Commands.execute('E1 = E');
+
+                Commands.execute('move D between A and B');
+                let row = SheetView.getActiveSheet().data[0];
+                assert(row.slice(0, 5).join('') === 'ADBCE', 'после between: ' + row.slice(0, 5).join(''));
+
+                Commands.execute('move A to end');
+                row = SheetView.getActiveSheet().data[0];
+                assert(row.slice(0, 4).join('') === 'DBCE', 'после to end: ' + row.slice(0, 4).join(''));
+                assert(row[9] === 'A', 'A должен встать в последний столбец J');
+
+                Commands.execute('move B to start');
+                row = SheetView.getActiveSheet().data[0];
+                assert(row.slice(0, 4).join('') === 'BDCE', 'после to start: ' + row.slice(0, 4).join(''));
+                assert(row[0] === 'B', 'столбец B не встал в начало');
+            });
+
+            await check('Commands: new/move переносят шрифты и ширины', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('D1 = старый');
+                Commands.execute('type D1 = B');
+                const sheet = SheetView.getActiveSheet();
+                sheet.colWidths['4'] = 20;
+
+                Commands.execute('new column between C and D');
+                assert(SheetView.getCellValue(0, 4) === 'старый', 'значение не сдвинулось');
+                assert(!SheetView.getCellFont(0, 3), 'у нового столбца не должно быть шрифта');
+                assert(SheetView.getCellFont(0, 4).bold, 'шрифт не переехал в E');
+                assert(sheet.colWidths['5'] === 20, 'ширина не переехала в E');
+                assert(!sheet.colWidths['4'], 'ширина осталась в D');
+            });
+
+            await check('Commands: move переносит шрифт и ширину', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('A1 = A');
+                Commands.execute('B1 = B');
+                Commands.execute('C1 = C');
+                Commands.execute('D1 = D');
+                Commands.execute('type D1 = B');
+                const sheet = SheetView.getActiveSheet();
+                sheet.colWidths['4'] = 20;
+
+                Commands.execute('move D between A and B');
+                assert(SheetView.getCellValue(0, 1) === 'D', 'D не встал в B');
+                assert(SheetView.getCellFont(0, 1).bold, 'шрифт не переехал в B');
+                assert(!SheetView.getCellFont(0, 3), 'шрифт остался в D');
+                assert(sheet.colWidths['2'] === 20, 'ширина не переехала в B');
+                assert(!sheet.colWidths['4'], 'ширина осталась в D');
+            });
+
+            await check('Commands: move вправо и с ключевыми словами', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('A1 = A');
+                Commands.execute('B1 = B');
+                Commands.execute('C1 = C');
+                Commands.execute('D1 = D');
+                Commands.execute('E1 = E');
+
+                Commands.execute('move A between C and D');
+                let row = SheetView.getActiveSheet().data[0];
+                assert(row.slice(0, 5).join('') === 'BCADE', 'move вправо: ' + row.slice(0, 5).join(''));
+
+                Commands.execute('move column D to end');
+                row = SheetView.getActiveSheet().data[0];
+                assert(row[9] === 'D', 'move column to end: D не в конце');
+
+                Commands.execute('A3 = строка3');
+                Commands.execute('move row 3 to start');
+                assert(SheetView.getCellValue(0, 0) === 'строка3', 'move row to start не сработал');
+            });
+
+            await check('Commands: move row to end на сетке больше, чем data', () => {
+                const wb = SheetView.emptyWorkbook();
+                wb.sheets[0].rows = 55;
+                SheetView.setWorkbook(wb);
+
+                Commands.execute('A8 = перенос');
+                Commands.execute('A9 = хвост');
+                Commands.execute('move 8 to end');
+                assert(SheetView.getGrid().rows === 55, 'сетка изменилась: ' + SheetView.getGrid().rows);
+                assert(SheetView.getCellValue(54, 0) === 'перенос', 'строка не встала в 55-ю');
+                assert(SheetView.getCellValue(7, 0) === 'хвост', 'строки ниже не сдвинулись: ' + SheetView.getCellValue(7, 0));
+
+                Commands.execute('move 55 to end'); // уже в конце — ничего не едет
+                assert(SheetView.getCellValue(54, 0) === 'перенос', 'строка сместилась');
+            });
+
+            await check('Commands: delete column/row', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('A1 = A');
+                Commands.execute('B1 = B');
+                Commands.execute('C1 = C');
+                Commands.execute('type C1 = B');
+
+                Commands.execute('new column');       // 10 → 11
+                Commands.execute('delete column B');  // 11 → 10, зеркально new
+                let row = SheetView.getActiveSheet().data[0];
+                assert(row.slice(0, 2).join('') === 'AC', 'C не сдвинулся: ' + row.join(','));
+                assert(SheetView.getGrid().cols === 10, 'столбцов: ' + SheetView.getGrid().cols);
+                assert(SheetView.getCellFont(0, 1).bold, 'формат C1 не переехал в B');
+
+                Commands.execute('A2 = две');
+                Commands.execute('A3 = три');
+                Commands.execute('new row');          // 50 → 51
+                Commands.execute('delete row 2');     // 51 → 50
+                assert(SheetView.getCellValue(1, 0) === 'три', 'строка 3 не поднялась');
+                assert(SheetView.getGrid().rows === 50, 'строк: ' + SheetView.getGrid().rows);
+
+                let err = null;
+                try { Commands.execute('delete 999'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса', 'delete 999: ' + (err && err.message));
+            });
+
+            await check('Commands: color ячеек, списки, диапазоны, строки/столбцы', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+
+                Commands.execute('color A1 = red');
+                assert(SheetView.getCellFont(0, 0).fill === 'FF0000', 'red не применён');
+                const td = document.querySelector('td[data-row="0"][data-col="0"]');
+                assert(td.style.backgroundColor === 'rgb(255, 0, 0)', 'фон не отрендерен: ' + td.style.backgroundColor);
+
+                Commands.execute('color A2, B3 -> C4 = grey');
+                assert(SheetView.getCellFont(1, 0).fill === 'B3B3B3', 'список не применён');
+                assert(SheetView.getCellFont(3, 2).fill === 'B3B3B3', 'диапазон не применён');
+
+                Commands.execute('color A1 = default');
+                assert(SheetView.getCellFont(0, 0).fill === 'FFFFFF', 'default не сбросил в белый');
+
+                Commands.execute('color 2 -> 3 = blue');   // строки
+                assert(SheetView.getCellFont(2, 5).fill === '007FFF', 'строки не окрашены');
+                Commands.execute('color C = green');        // столбец
+                assert(SheetView.getCellFont(9, 2).fill === '00FF00', 'столбец не окрашен');
+                Commands.execute('color A1, 5 = yellow');   // ячейка + строка вместе
+                assert(SheetView.getCellFont(4, 0).fill === 'FFFF00' && SheetView.getCellFont(0, 0).fill === 'FFFF00',
+                    'ячейка и строка вместе не применились');
+
+                let err = null;
+                try { Commands.execute('color 2, C = red'); } catch (e) { err = e; }
+                assert(err && err.message === 'Укажите либо только строки либо только столбцы',
+                    'сообщение: ' + (err && err.message));
+
+                err = null;
+                try { Commands.execute('color A1 = purple'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса', 'неизвестный цвет: ' + (err && err.message));
+            });
+
+            await check('Commands: union и split', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('A1 = шапка');
+                Commands.execute('A2 = под ней');
+                Commands.execute('B1 = тоже под');
+
+                Commands.execute('union A1 -> B2');
+                const mergesNow = SheetView.getActiveSheet().merges || [];
+                const m = mergesNow[0];
+                assert(m && m.r0 === 0 && m.c0 === 0 && m.r1 === 1 && m.c1 === 1, 'union не записан');
+                assert(SheetView.getCellValue(1, 0) === '' && SheetView.getCellValue(0, 1) === '',
+                    'текст под объединением не очищен');
+
+                const anchor = document.querySelector('td[data-row="0"][data-col="0"]');
+                assert(anchor.colSpan === 2 && anchor.rowSpan === 2,
+                    'нет span: ' + anchor.colSpan + '/' + anchor.rowSpan);
+                assert(!document.querySelector('td[data-row="1"][data-col="0"]'), 'покрытая ячейка отрисована');
+                const firstRowTds = document.querySelectorAll('tbody tr[data-row="0"] td');
+                assert(firstRowTds.length === 9, 'ячеек в строке 1: ' + firstRowTds.length);
+
+                Commands.execute('split A1 -> B2');
+                assert(!SheetView.getActiveSheet().merges, 'split не убрал объединение');
+                assert(document.querySelector('td[data-row="0"][data-col="1"]'), 'B1 не вернулась');
+
+                let err = null;
+                try { Commands.execute('union A1 B2'); } catch (e) { err = e; }
+                assert(err && /формате ячейка1->ячейка2/.test(err.message), 'A1 B2: ' + (err && err.message));
+                err = null;
+                try { Commands.execute('union A1'); } catch (e) { err = e; }
+                assert(err && /формате ячейка1->ячейка2/.test(err.message), 'A1: ' + (err && err.message));
+                err = null;
+                try { Commands.execute('union A1 -> B2, C3'); } catch (e) { err = e; }
+                assert(err && /формате ячейка1->ячейка2/.test(err.message), 'список ranges');
+                err = null;
+                try { Commands.execute('split A1 -> B2'); } catch (e) { err = e; }
+                assert(err && /не найдена/.test(err.message), 'split без объединения: ' + (err && err.message));
+            });
+
+            await check('Commands: width — столбец, ячейка, диапазон, список', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+
+                Commands.execute('C width = 300%');       // 80px → 240px
+                const w3 = SheetView.getActiveSheet().colWidths['3'];
+                assert(Math.abs(w3 - (240 - 5) / 7) < 0.2, 'ширина C: ' + w3);
+
+                Commands.execute('A1 width = 50%');       // ячейка → её столбец
+                assert(Math.abs(SheetView.getActiveSheet().colWidths['1'] - (40 - 5) / 7) < 0.2,
+                    'через ячейку: ' + SheetView.getActiveSheet().colWidths['1']);
+
+                Commands.execute('A width = 300%');       // A: 40 → 120px
+                Commands.execute('A1 -> B2 width = 50%'); // (120+80)*0.5/2 = 50px на столбец
+                const sheet = SheetView.getActiveSheet();
+                assert(Math.abs(sheet.colWidths['1'] - (50 - 5) / 7) < 0.2, 'диапазон A: ' + sheet.colWidths['1']);
+                assert(Math.abs(sheet.colWidths['2'] - (50 - 5) / 7) < 0.2, 'диапазон B: ' + sheet.colWidths['2']);
+
+                Commands.execute('A, C width = 100%');    // список — обе по 100%
+
+                let err = null;
+                try { Commands.execute('5 width = 100%'); } catch (e) { err = e; }
+                assert(err && err.message === 'оператор width работает только со столбцами',
+                    'сообщение: ' + (err && err.message));
+            });
+
+            await check('Commands: height — строка, ячейка, диапазон, ошибка', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+
+                Commands.execute('7 height = 150%');      // 20 → 30px
+                assert(SheetView.getActiveSheet().rowHeights['7'] === 30,
+                    'строка 7: ' + SheetView.getActiveSheet().rowHeights['7']);
+
+                Commands.execute('A1 height = 50%');      // ячейка → её строка
+                assert(SheetView.getActiveSheet().rowHeights['1'] === 10,
+                    'строка 1: ' + SheetView.getActiveSheet().rowHeights['1']);
+
+                const tr = document.querySelector('tbody tr[data-row="0"]');
+                assert(tr.style.height === '10px', 'высота не применена: ' + tr.style.height);
+                assert(tr.querySelector('.cell-inner'), 'нет обрезки содержимого');
+
+                Commands.execute('2 -> 4 height = 200%'); // строки 2..4 по 40px
+                assert(SheetView.getActiveSheet().rowHeights['3'] === 40,
+                    'диапазон строк: ' + SheetView.getActiveSheet().rowHeights['3']);
+
+                let err = null;
+                try { Commands.execute('C height = 100%'); } catch (e) { err = e; }
+                assert(err && err.message === 'оператор height работает только со строками',
+                    'сообщение: ' + (err && err.message));
+            });
+
+            await check('Commands: size — масштаб ячейки и диапазона', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+
+                Commands.execute('C21 -> D25 size = 200%');
+                const sheet = SheetView.getActiveSheet();
+                assert(Math.abs(sheet.colWidths['3'] - (160 - 5) / 7) < 0.2, 'столбец C: ' + sheet.colWidths['3']);
+                assert(Math.abs(sheet.colWidths['4'] - (160 - 5) / 7) < 0.2, 'столбец D: ' + sheet.colWidths['4']);
+                assert(sheet.rowHeights['21'] === 40 && sheet.rowHeights['25'] === 40,
+                    'высоты 21/25: ' + sheet.rowHeights['21'] + '/' + sheet.rowHeights['25']);
+
+                Commands.execute('A1 size = 150%');
+                assert(Math.abs(SheetView.getActiveSheet().colWidths['1'] - (120 - 5) / 7) < 0.2, 'столбец ячейки');
+                assert(SheetView.getActiveSheet().rowHeights['1'] === 30, 'строка ячейки');
+            });
+
+            await check('Commands: normalize подгоняет размеры под текст', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('A1 = Очень длинная строка для проверки нормализации');
+                Commands.execute('3 height = 50%');
+
+                Commands.execute('normalize');
+                const sheet = SheetView.getActiveSheet();
+                assert(Number(sheet.colWidths['1']) > 20, 'столбец A не расширен: ' + sheet.colWidths['1']);
+                assert(Object.keys(sheet.rowHeights || {}).length === 0, 'высоты строк не сброшены');
+                assert(!document.querySelector('tbody tr[data-row="2"]').style.height,
+                    'высота осталась в DOM');
+
+                Commands.execute('A1 = корот');
+                Commands.execute('normalize');
+                assert(Number(SheetView.getActiveSheet().colWidths['1']) < 12,
+                    'столбец A не сузился: ' + SheetView.getActiveSheet().colWidths['1']);
+            });
+
+            await check('SheetView: ctrl+колесо — масштаб, обычное колесо — скролл', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                const container = document.getElementById('table-container');
+
+                const plain = new WheelEvent('wheel', { deltaY: -100, bubbles: true, cancelable: true });
+                container.dispatchEvent(plain);
+                assert(SheetView.getZoom() === 1, 'без ctrl зумить нельзя: ' + SheetView.getZoom());
+                assert(!plain.defaultPrevented, 'обычное колесо не должно гаситься (скролл)');
+
+                const withCtrl = new WheelEvent('wheel',
+                    { deltaY: -100, ctrlKey: true, bubbles: true, cancelable: true });
+                container.dispatchEvent(withCtrl);
+                assert(withCtrl.defaultPrevented, 'ctrl+колесо не перехвачено (браузерный зум)');
+                assert(Math.abs(SheetView.getZoom() - 1.1) < 0.01, 'zoom: ' + SheetView.getZoom());
+                assert(document.querySelector('table.excel-table').style.zoom === '1.1',
+                    'zoom не применён к таблице');
+                assert(SheetView.getActiveSheet().zoom === 1.1, 'zoom не в модели');
+
+                SheetView.setZoom(99);
+                assert(SheetView.getZoom() === 5, 'максимум 500%: ' + SheetView.getZoom());
+                SheetView.setZoom(0.01);
+                assert(SheetView.getZoom() === 0.2, 'минимум 20%: ' + SheetView.getZoom());
+                SheetView.setZoom(1);
+                assert(!SheetView.getActiveSheet().zoom, 'zoom не убран при 100%');
+            });
+
+            await check('Commands: новые команды будят onChange (сохранение Draft)', () => {
+                let calls = 0;
+                SheetView.init(document.getElementById('sheet-tabs'),
+                    document.getElementById('table-container'), () => { calls++; });
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+
+                const before = calls;
+                Commands.execute('color A1 = red');
+                assert(calls > before, 'color не дёрнул onChange');
+
+                const mid = calls;
+                Commands.execute('delete row 2');
+                assert(calls > mid, 'delete не дёрнул onChange');
+
+                const afterDelete = calls;
+                Commands.execute('union A1 -> B2');
+                assert(calls > afterDelete, 'union не дёрнул onChange');
+                assert(SheetView.hasChanges(), 'после новых команд нет изменений');
+            });
+
+            await check('Commands: clear — содержимое и type=default', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('E10 = текст');
+                Commands.execute('type E10 = B and I');
+                Commands.execute('F11 = x');
+                Commands.execute('G12 = y');
+
+                Commands.execute('clear E10 -> F11');
+                assert(SheetView.getCellValue(9, 4) === '', 'E10 не очищена');
+                assert(SheetView.getCellValue(10, 5) === '', 'F11 не очищена');
+                assert(!SheetView.getCellFont(9, 4), 'тип шрифта не сброшен в default');
+                assert(SheetView.getActiveSheet().data[11][6] === 'y', 'задето вне диапазона');
+
+                Commands.execute('clear E10, G12');        // список ячеек и диапазонов
+                assert(SheetView.getCellValue(11, 6) === '', 'G12 не очищена');
+
+                // clear не трогает фон: для него есть color default
+                Commands.execute('A1 = v');
+                Commands.execute('color A1 = red');
+                Commands.execute('type A1 = B');
+                Commands.execute('clear A1');
+                const font = SheetView.getCellFont(0, 0);
+                assert(!font.bold && font.fill === 'FF0000',
+                    'должен сняться B, а fill остаться: ' + JSON.stringify(font));
+                assert(SheetView.getCellValue(0, 0) === '', 'значение не очищено');
+
+                let err = null;
+                try { Commands.execute('clear A1 -> Z9999'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса', 'выход за сетку пропущен');
+                err = null;
+                try { Commands.execute('clear 5'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса', 'строки не должны очищаться');
+            });
+
+            await check('Commands: border — периметр, стороны, null, ошибки', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+
+                Commands.execute('border B12 = up, right');
+                const b = SheetView.getActiveSheet().borders['11:1'];
+                assert(b && b.up && b.right && !b.left && !b.down, JSON.stringify(b));
+                const td = document.querySelector('td[data-row="11"][data-col="1"]');
+                assert(/1pt/.test(td.style.borderTop), 'рамка сверху не отрендерена: ' + td.style.borderTop);
+                assert(!td.style.borderLeft, 'лишняя рамка слева');
+
+                Commands.execute('border A1 -> C3 = all');
+                const borders = SheetView.getActiveSheet().borders;
+                // Обычный диапазон: рамка вокруг каждой ячейки
+                for (const key of ['0:0', '0:1', '1:0', '1:1', '2:2']) {
+                    const cell = borders[key];
+                    assert(cell && cell.up && cell.down && cell.left && cell.right,
+                        'нет полной рамки у ' + key + ': ' + JSON.stringify(cell));
+                }
+
+                Commands.execute('border C = down');        // низ столбца C
+                assert(SheetView.getActiveSheet().borders['49:2'].down, 'низ столбца не помечен');
+
+                Commands.execute('border A1 = null');      // снять всё с A1
+                assert(!SheetView.getActiveSheet().borders['0:0'], 'null не снял рамку');
+
+                let err = null;
+                try { Commands.execute('border A1 = all, up'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса', 'all+up: ' + (err && err.message));
+                err = null;
+                try { Commands.execute('border A1 = left, left'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса', 'дубли пропустили');
+                err = null;
+                try { Commands.execute('border A1 = middle'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса', 'неизвестная сторона прошла');
+                err = null;
+                try { Commands.execute('border A1 = up, null'); } catch (e) { err = e; }
+                assert(err && err.message === 'ошибка синтаксиса', 'up+null пропустили');
+            });
+
+            await check('Complete: читает words/syntax/help из commands.yaml', async () => {
+                window.fetch = REAL_FETCH; // ниже по файлу fetch подменён стабами
+                const dict = await Complete.load('../commands.yaml');
+                assert(dict.words.includes('width') && dict.words.includes('height'), 'words не загружены');
+                assert(dict.words.includes('border') && dict.words.includes('null'), 'words неполные');
+                assert(dict.syntax.some(s => s.includes('normalize')), 'syntax не загружен');
+                assert(dict.help.length > 5 && dict.help.some(h => h.includes('border')), 'help не загружен');
+                assert(Complete.getHelp().length === dict.help.length, 'getHelp расходится');
+            });
+
+            await check('Complete: подсказка слова и подстановка по Tab', () => {
+                assert(Complete.suggest('col') === 'column', 'col → ' + Complete.suggest('col'));
+                assert(Complete.suggest('new col') === 'column', 'после пробела');
+                assert(Complete.suggest('union') === null, 'точное совпадение не подсказывает');
+                assert(Complete.suggest('A1') === null, 'ссылки не дополняются');
+
+                const input = document.createElement('input');
+                const hint = document.createElement('span');
+                document.body.appendChild(input);
+                document.body.appendChild(hint);
+                Complete.attach(input, hint);
+
+                input.value = 'col';
+                input.setSelectionRange(3, 3);
+                input.dispatchEvent(new Event('input'));
+                assert(/Tab → column/.test(hint.textContent), 'подсказка: ' + hint.textContent);
+
+                input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+                assert(input.value === 'column', 'после Tab: ' + input.value);
+
+                input.value = 'color re';
+                input.setSelectionRange(8, 8);
+                input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+                assert(input.value === 'color red', 'второе слово: ' + input.value);
+
+                input.parentNode.removeChild(input);
+                hint.parentNode.removeChild(hint);
+            });
+
+            await check('Commands: кириллическая буква столбца', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('А1 = кириллица');
+                assert(SheetView.getCellValue(0, 0) === 'кириллица', 'ссылка с кириллицей не сработала');
+            });
+
+            await check('SheetView: ширина растёт только под длинный текст', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                const cell = document.querySelector('td[data-row="0"][data-col="0"]');
+                const initial = cell.getBoundingClientRect().width;
+
+                cell.textContent = 'x';
+                cell.dispatchEvent(new Event('input'));
+                assert(Math.abs(cell.getBoundingClientRect().width - initial) < 1,
+                    'короткий текст изменил ширину');
+
+                cell.textContent = 'Очень длинный текст, который явно шире ячейки';
+                cell.dispatchEvent(new Event('input'));
+                assert(cell.getBoundingClientRect().width > initial + 20,
+                    'длинный текст не расширил столбец');
+            });
+
+            await check('SheetView: Enter сохраняет перевод строки и растит строку', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                const cell = document.querySelector('td[data-row="0"][data-col="0"]');
+                const row = cell.closest('tr');
+                const oneLine = row.getBoundingClientRect().height;
+
+                cell.innerText = 'первая\nвторая';
+                cell.dispatchEvent(new Event('input'));
+
+                assert(SheetView.getActiveSheet().data[0][0] === 'первая\nвторая',
+                    'перевод строки потерян: ' + JSON.stringify(SheetView.getActiveSheet().data[0][0]));
+                assert(row.getBoundingClientRect().height > oneLine + 5,
+                    'высота строки не выросла');
+            });
+
+            await check('SheetView: правка ячейки, шрифт, markSaved', () => {
+                let dirtyCount = -1;
+                SheetView.init(
+                    document.getElementById('sheet-tabs'),
+                    document.getElementById('table-container'),
+                    n => { dirtyCount = n; }
+                );
+                SheetView.setWorkbook(Converter.parse(SAMPLE));
+
+                const tabs = document.querySelectorAll('.sheet-tab');
+                assert(tabs.length === 2, 'ожидалось 2 вкладки');
+
+                const cell = document.querySelector('td[data-row="1"][data-col="1"]');
+                assert(cell && cell.textContent === '100', 'ячейка B2 должна содержать 100');
+                const boldCell = document.querySelector('td[data-row="0"][data-col="0"]');
+                assert(boldCell.style.fontWeight === '700', 'жирность A1 не применена');
+
+                cell.textContent = '150';
+                cell.dispatchEvent(new Event('input'));
+                assert(SheetView.getActiveSheet().data[1][1] === '150', 'данные не обновились');
+                assert(dirtyCount === 1, 'callback получил ' + dirtyCount);
+
+                SheetView.markSaved();
+                assert(!SheetView.hasChanges(), 'dirty не очищен');
+                assert(!document.querySelector('td.modified'), 'подсветка не снята');
+            });
+
+            await check('SheetView: переключение листов сохраняет правки', () => {
+                const tabs = document.querySelectorAll('.sheet-tab');
+                tabs[1].click();
+                assert(document.querySelector('.excel-table').textContent.includes('x'), 'второй лист не отрисован');
+                tabs[0].click();
+                assert(document.querySelector('td[data-row="1"][data-col="1"]').textContent === '150',
+                    'правка потерялась');
+            });
+
+            // --- Dialog ---
+            await check('Dialog.normalizePath: слеши, расширение, запрет ..', () => {
+                assert(Dialog.normalizePath('sub\\a') === 'sub/a.json', 'обратные слеши');
+                assert(Dialog.normalizePath('/a.JSON') === 'a.JSON', 'ведущий слеш');
+                assert(Dialog.normalizePath('  ') === '', 'пустой путь');
+                assert(Dialog.normalizePath('../secret') === '', 'выход через ..');
+                assert(Dialog.normalizePath('sub/../a') === '', 'вложенный ..');
+                assert(Dialog.normalizePath('sub//a') === 'sub/a.json', 'двойной слеш');
+            });
+
+            await check('Dialog.saveAs: возвращает нормализованный путь', async () => {
+                const promise = Dialog.saveAs('Имя', ['', 'sub']);
+                const input = document.querySelector('.modal-input');
+                input.value = 'sub\\отчёт';
+                document.querySelector('.modal-actions .btn-primary').click();
+                const path = await promise;
+                assert(path === 'sub/отчёт.json', 'путь: ' + path);
+                assert(!document.querySelector('.modal-overlay'), 'модалка не закрыта');
+            });
+
+            await check('Dialog.openJson: выбор файла включает кнопку', async () => {
+                const promise = Dialog.openJson([
+                    { name: 'data', path: 'data', type: 'tree' },
+                    { name: 'a.json', path: 'data/a.json', type: 'blob' }
+                ]);
+                document.querySelector('.modal-tree .tree-file').click();
+                const openBtn = document.querySelector('.modal-actions .btn-primary');
+                assert(openBtn.disabled === false, 'кнопка Открыть не включилась');
+                openBtn.click();
+                const path = await promise;
+                assert(path === 'data/a.json', 'выбран ' + path);
+            });
+
+            await check('Dialog.unsavedChanges: Удалить и Отмена', async () => {
+                const first = Dialog.unsavedChanges('a.json', []);
+                document.querySelector('.modal-actions .btn-danger').click();
+                assert((await first).action === 'discard', 'ожидался discard');
+
+                const second = Dialog.unsavedChanges('a.json', []);
+                document.querySelector('.modal-actions .btn-secondary').click();
+                assert((await second).action === 'cancel', 'ожидался cancel');
+            });
+
+            // --- Draft ---
+            await check('Draft: сохранение, загрузка и очистка', () => {
+                Draft.clear();
+                Draft.save({ workbook: { sheets: [{ name: 'S', data: [['v']] }] }, dirtyKeys: ['0:0:0'], activeIndex: 0 });
+                return new Promise(resolve => setTimeout(() => {
+                    const loaded = Draft.load();
+                    assert(loaded && loaded.workbook.sheets[0].data[0][0] === 'v', 'черновик не сохранён');
+                    assert(loaded.dirtyKeys.length === 1, 'dirtyKeys потеряны');
+                    Draft.clear();
+                    assert(Draft.load() === null, 'черновик не очищен');
+                    resolve();
+                }, 450));
+            });
+
+            // --- Core ---
+            await check('Core: открытие → правка → сохранение', async () => {
+                Core.init({ status: () => {}, mode: 'gitlab' });
+                const log = [];
+                let commitId = 'cmp-1';
+
+                stubFetch((url, method) => {
+                    if (url.includes('/repository/tree')) {
+                        return jsonResponse([{ name: 'a.json', path: 'data/a.json', type: 'blob' }]);
+                    }
+                    if (method === 'GET' && url.includes('/repository/files/')) {
+                        return jsonResponse({ content: b64utf8(SAMPLE), last_commit_id: commitId });
+                    }
+                    if (method === 'PUT') {
+                        commitId = 'cmp-2';
+                        return jsonResponse({ file_path: 'data/a.json' });
+                    }
+                    throw new Error('неожиданный запрос ' + method + ' ' + url);
+                }, log);
+
+                await Core.loadProject({
+                    projectUrl: 'https://gitlab.example.com/group/project',
+                    token: 'tok',
+                    ref: 'main',
+                    folder: 'data'
+                });
+                assert(document.querySelectorAll('#tree .tree-file').length === 1, 'дерево не отрисовано');
+
+                await Core.openFile('data/a.json');
+                assert(Core.getCurrentPath() === 'data/a.json', 'путь не установлен');
+
+                const cell = document.querySelector('td[data-row="1"][data-col="1"]');
+                cell.textContent = '777';
+                cell.dispatchEvent(new Event('input'));
+
+                await Core.save();
+
+                const put = log.find(r => r.method === 'PUT');
+                assert(put, 'PUT не отправлен');
+                const body = JSON.parse(put.body);
+                assert(body.last_commit_id === 'cmp-1', 'неверный last_commit_id');
+                assert(body.content.includes('777'), 'правка не попала в тело');
+                assert(body.content.includes('"fonts"'), 'шрифты потеряны при сохранении');
+                assert(!SheetView.hasChanges(), 'остались изменения');
+            });
+
+            await check('Core.saveAs: новый файл создаётся через POST', async () => {
+                Core.init({ status: () => {}, mode: 'local', localUrl: 'http://127.0.0.1:8787' });
+                const log = [];
+                stubFetch((url, method) => {
+                    if (method === 'GET') return jsonResponse({ message: 'not found' }, 404);
+                    return jsonResponse({ file_path: 'new/a.json' });
+                }, log);
+
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                const cell = document.querySelector('td[data-row="0"][data-col="0"]');
+                cell.textContent = 'new';
+                cell.dispatchEvent(new Event('input'));
+                Commands.execute('new row');
+
+                await Core.saveAs('new/a.json');
+                const post = log.find(r => r.method === 'POST');
+                assert(post, 'ожидался POST для нового файла');
+                assert(post.url.includes('/api/files/new%2Fa.json'), 'неверный URL: ' + post.url);
+                assert(Core.getCurrentPath() === 'new/a.json', 'путь не сохранён');
+                assert(JSON.parse(post.body).content.includes('"rows": 51'),
+                    'добавленная строка не попала в JSON');
+            });
+
+            await check('Core: без настроенного адаптера — понятная ошибка', async () => {
+                LocalAPI.init('');
+                Core.init({ status: () => {}, mode: 'local', localUrl: '' });
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+
+                let err = null;
+                try { await Core.saveAs('a.json'); } catch (e) { err = e; }
+                assert(err && /Локальный сервис не настроен/.test(err.message),
+                    'сообщение: ' + (err && err.message));
+            });
+
+            await check('Core: новый проект сбрасывает открытый документ', async () => {
+                Core.init({ status: () => {}, mode: 'gitlab' });
+                stubFetch((url) => {
+                    if (url.includes('/repository/tree')) return jsonResponse([]);
+                    throw new Error('неожиданный запрос ' + url);
+                });
+
+                await Core.loadProject({
+                    projectUrl: 'https://gitlab.example.com/group/other-project',
+                    token: 'tok',
+                    ref: 'main',
+                    folder: 'data'
+                });
+
+                assert(Core.getCurrentPath() === null, 'путь прошлого проекта сохранился');
+                assert(SheetView.getWorkbook().sheets.length === 1, 'должен остаться пустой лист');
+                assert(SheetView.getActiveSheet().data.length === 0, 'данные не сброшены');
+            });
+
+            await check('Commands: color — пробелы и default как у остальных цветов', () => {
+                for (const [line, fill, cells] of [
+                    ['color A1 -> C3 = default', 'FFFFFF', [[0, 0], [1, 1], [2, 2]]],
+                    ['color A1->C3 = red', 'FF0000', [[0, 0], [1, 1], [2, 2]]],
+                    ['color A1  ->  C3 = green', '00FF00', [[0, 0], [1, 1], [2, 2]]],
+                    ['color A1 , B2 -> C3 = blue', '007FFF', [[0, 0], [1, 1], [2, 2]]]
+                ]) {
+                    SheetView.setWorkbook(SheetView.emptyWorkbook());
+                    Commands.execute(line);
+                    for (const [r, c] of cells) {
+                        const font = SheetView.getCellFont(r, c);
+                        assert(font && font.fill === fill,
+                            line + ': ' + r + ':' + c + ' = ' + JSON.stringify(font));
+                    }
+                }
+
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('color 2 -> 3 = default');
+                assert(SheetView.getCellFont(1, 0).fill === 'FFFFFF', 'строки с default');
+                Commands.execute('color C = default');
+                assert(SheetView.getCellFont(0, 2).fill === 'FFFFFF', 'столбец с default');
+            });
+
+            await check('Commands: border all — union по периметру, после split периметр сохраняется', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('union A1 -> B2');
+                Commands.execute('border A1 -> B2 = all');
+
+                let borders = SheetView.getActiveSheet().borders;
+                assert(borders['0:0'].up && borders['0:0'].left, 'A1 верх/лево');
+                assert(!borders['0:0'].down && !borders['0:0'].right, 'A1 внутренние стороны');
+                assert(borders['0:1'].up && borders['0:1'].right, 'B1 верх/право');
+                assert(borders['1:0'].down && borders['1:0'].left, 'A2 низ/лево');
+                assert(borders['1:1'].down && borders['1:1'].right, 'B2 низ/право');
+                assert(!borders['1:0'].up && !borders['1:1'].left, 'внутренние стороны диапазона');
+
+                const anchor = document.querySelector('td[data-row="0"][data-col="0"]');
+                assert(/1pt/.test(anchor.style.borderTop) && /1pt/.test(anchor.style.borderBottom) &&
+                    /1pt/.test(anchor.style.borderLeft) && /1pt/.test(anchor.style.borderRight),
+                    'объединённый якорь без периметра: ' + anchor.getAttribute('style'));
+
+                Commands.execute('split A1 -> B2');
+                borders = SheetView.getActiveSheet().borders;
+                assert(borders['0:0'].up && borders['0:0'].left &&
+                    !borders['0:0'].down && !borders['0:0'].right, 'A1 после split');
+                assert(borders['0:1'].up && borders['0:1'].right &&
+                    !borders['0:1'].down && !borders['0:1'].left, 'B1 после split');
+                assert(borders['1:0'].down && borders['1:0'].left &&
+                    !borders['1:0'].up && !borders['1:0'].right, 'A2 после split');
+                assert(borders['1:1'].down && borders['1:1'].right &&
+                    !borders['1:1'].up && !borders['1:1'].left, 'B2 после split');
+
+                const b1 = document.querySelector('td[data-row="0"][data-col="1"]');
+                assert(/1pt/.test(b1.style.borderTop) && /1pt/.test(b1.style.borderRight) &&
+                    !b1.style.borderLeft && !b1.style.borderBottom,
+                    'B1 после split: ' + b1.getAttribute('style'));
+            });
+
+            await check('Commands: border all — union убирает внутренние стороны', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('border A1 -> B2 = all'); // рамка у каждой ячейки
+                Commands.execute('union A1 -> B2');
+                Commands.execute('border A1 -> B2 = all');  // остаётся только периметр
+
+                const borders = SheetView.getActiveSheet().borders;
+                assert(borders['0:0'].up && borders['0:0'].left &&
+                    !borders['0:0'].down && !borders['0:0'].right, 'A1 ' + JSON.stringify(borders['0:0']));
+                assert(borders['1:1'].down && borders['1:1'].right &&
+                    !borders['1:1'].up && !borders['1:1'].left, 'B2 ' + JSON.stringify(borders['1:1']));
+            });
+
+            await check('Commands: цепочка — наследование ячеек и ошибки', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('( type A1, B1 = B ) + ( color = green ) + ( border = all )');
+
+                for (const [r, c] of [[0, 0], [0, 1]]) {
+                    const font = SheetView.getCellFont(r, c);
+                    assert(font && font.bold && font.fill === '00FF00',
+                        'шрифт/цвет ' + r + ':' + c + ': ' + JSON.stringify(font));
+                    const b = SheetView.getActiveSheet().borders[`${r}:${c}`];
+                    assert(b && b.up && b.down && b.left && b.right, 'рамка ' + r + ':' + c);
+                }
+
+                let err = null;
+                try { Commands.execute('(type = B, _)+(color = green)+(border = all)'); } catch (e) { err = e; }
+                assert(err && err.message === 'Не указаны ячейки', 'получено: ' + (err && err.message));
+
+                err = null;
+                try { Commands.execute('(type = B, _)+(color A1, B1 = green)+(border = all)'); } catch (e) { err = e; }
+                assert(err && err.message === 'Ячейки обязательно должны быть указаны в первой команде',
+                    'получено: ' + (err && err.message));
+            });
+
+            await check('Commands: цепочка — разные ячейки и наследование от ближайшей', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('(type A1, B1 = B, _)+(color = green)+(color A2, B2 = yellow)+(border = all)');
+
+                let font = SheetView.getCellFont(0, 0);
+                assert(font && font.bold && font.underline && font.fill === '00FF00',
+                    'A1: ' + JSON.stringify(font));
+                font = SheetView.getCellFont(1, 0);
+                assert(font && !font.bold && !font.underline && font.fill === 'FFFF00',
+                    'A2: ' + JSON.stringify(font));
+
+                const borders = SheetView.getActiveSheet().borders;
+                for (const key of ['1:0', '1:1']) {
+                    const b = borders[key];
+                    assert(b && b.up && b.down && b.left && b.right, 'рамка ' + key);
+                }
+                assert(!borders['0:0'] && !borders['0:1'], 'рамка не должна попасть на A1/B1');
+            });
+
+            await check('Commands: цепочка — вложенность, низкий уровень первым', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute(
+                    '((type A1, B1 = B)+(color = green)+(type A2, B2 = I)+(color = yellow))+(border = all)');
+
+                let font = SheetView.getCellFont(0, 0);
+                assert(font && font.bold && !font.italic && font.fill === '00FF00',
+                    'A1: ' + JSON.stringify(font));
+                font = SheetView.getCellFont(1, 0);
+                assert(font && !font.bold && font.italic && font.fill === 'FFFF00',
+                    'A2: ' + JSON.stringify(font));
+
+                for (const key of ['0:0', '0:1', '1:0', '1:1']) {
+                    const b = SheetView.getActiveSheet().borders[key];
+                    assert(b && b.up && b.down && b.left && b.right, 'рамка ' + key);
+                }
+            });
+
+            await check('Commands: цепочка — присваивание как источник ячеек', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('(A1, B1 = текст)+(color = green)');
+                assert(SheetView.getCellValue(0, 0) === 'текст' &&
+                    SheetView.getCellValue(0, 1) === 'текст', 'значения не записаны');
+                assert(SheetView.getCellFont(0, 0).fill === '00FF00' &&
+                    SheetView.getCellFont(0, 1).fill === '00FF00', 'цвет не унаследован');
+
+                Commands.execute('(C width = 150%)+(color A1 = red)');
+                assert(SheetView.getCellFont(0, 0).fill === 'FF0000', 'dim-команда в цепочке');
+            });
+
+            await check('Commands: цепочка — union → border → split', () => {
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('(union A1 -> B2)+(border = all)+(split A1 -> B2)');
+
+                const borders = SheetView.getActiveSheet().borders;
+                assert(borders['0:0'].up && borders['0:0'].left &&
+                    !borders['0:0'].down && !borders['0:0'].right, 'A1 после split');
+                assert(borders['0:1'].up && borders['0:1'].right, 'B1 после split');
+                assert(borders['1:0'].down && borders['1:0'].left, 'A2 после split');
+                assert(borders['1:1'].down && borders['1:1'].right, 'B2 после split');
+                assert(!SheetView.getActiveSheet().merges, 'union не разъединён');
+            });
+
+            await check('Commands: цепочка — приоритет ошибок и скобки в значениях', () => {
+                let err = null;
+                try { Commands.execute('(color A1 = red) (color A2 = blue)'); } catch (e) { err = e; }
+                assert(err && err.message === 'Отсутствует разделитель "+" между командами',
+                    'разделитель: ' + (err && err.message));
+
+                err = null;
+                try { Commands.execute('(color A1 = red) color A2 = blue'); } catch (e) { err = e; }
+                assert(err && err.message === 'Команда должна быть экранирована "(" или ")"',
+                    'экранирование: ' + (err && err.message));
+
+                err = null;
+                try {
+                    Commands.execute('(color A1 = red) (color A2 = blue) color A3 = green');
+                } catch (e) { err = e; }
+                assert(err && err.message === 'Команда должна быть экранирована "(" или ")"',
+                    'приоритет: ' + (err && err.message));
+
+                err = null;
+                try { Commands.execute('(color A1 = red'); } catch (e) { err = e; }
+                assert(err && err.message === 'Команда должна быть экранирована "(" или ")"',
+                    'незакрытая скобка: ' + (err && err.message));
+
+                err = null;
+                try { Commands.execute('color A1 = red + color A2 = blue'); } catch (e) { err = e; }
+                assert(err && err.message === 'Команда должна быть экранирована "(" или ")"',
+                    'несколько команд без скобок: ' + (err && err.message));
+
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('A1 = текст (пояснение)');
+                assert(SheetView.getCellValue(0, 0) === 'текст (пояснение)', 'скобки в значении');
+                Commands.execute('A2 = 2+2');
+                assert(SheetView.getCellValue(1, 0) === '2+2', 'плюс в значении');
+                Commands.execute('A3 = x+(y)');
+                assert(SheetView.getCellValue(2, 0) === 'x+(y)', 'плюс и скобки в значении');
+                Commands.execute('A4 = (см. сноску)+');
+                assert(SheetView.getCellValue(3, 0) === '(см. сноску)+', 'группа-текст перед плюсом');
+
+                SheetView.setWorkbook(SheetView.emptyWorkbook());
+                Commands.execute('(A1 = текст (пояснение))+(color = red)');
+                assert(SheetView.getCellValue(0, 0) === 'текст (пояснение)',
+                    'скобки в значении внутри цепочки');
+                assert(SheetView.getCellFont(0, 0).fill === 'FF0000', 'цвет не унаследован');
+            });
+
+            // --- Render report ---
+            const failed = results.filter(r => !r.ok);
+            document.getElementById('results').textContent = results
+                .map(r => (r.ok ? 'PASS ' : 'FAIL ') + r.name + (r.ok ? '' : ' — ' + r.error))
+                .join('\n') + '\nSUMMARY: ' + (failed.length ? 'FAIL' : 'PASS') +
+                ' (' + (results.length - failed.length) + '/' + results.length + ')';
+            document.body.dataset.status = failed.length ? 'fail' : 'pass';
+        })();
+    </script>
+</body>
+</html>

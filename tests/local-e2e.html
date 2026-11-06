@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Local API e2e</title>
+</head>
+<body>
+    <pre id="results"></pre>
+
+    <script src="../js/local-api.js"></script>
+    <script>
+        const results = [];
+        function assert(cond, msg) {
+            if (!cond) throw new Error(msg || 'assertion failed');
+        }
+        async function check(name, fn) {
+            try {
+                await fn();
+                results.push({ name, ok: true });
+            } catch (e) {
+                results.push({ name, ok: false, error: e.message });
+            }
+        }
+
+        (async () => {
+            LocalAPI.init('http://127.0.0.1:8787');
+            const payload = JSON.stringify({
+                sheets: [{ name: 'Проверка', data: [['кириллица', '42']] }]
+            }, null, 2);
+            const path = 'e2e/проверка-' + Date.now() + '.json';
+
+            await check('GET /api/tree отвечает', async () => {
+                const items = await LocalAPI.getTree('');
+                assert(Array.isArray(items), 'ожидался массив');
+            });
+
+            await check('POST создаёт файл, GET читает UTF-8', async () => {
+                await LocalAPI.saveFile(path, payload, '', null, true);
+                const file = await LocalAPI.readFile(path);
+                assert(file.content === payload, 'содержимое не совпало');
+                assert(/^[0-9a-f]{64}$/.test(file.lastCommitId), 'нет sha256-версии');
+            });
+
+            await check('PUT с верной версией обновляет файл', async () => {
+                const file = await LocalAPI.readFile(path);
+                const updated = payload.replace('42', '43');
+                await LocalAPI.saveFile(path, updated, '', file.lastCommitId, false);
+                const after = await LocalAPI.readFile(path);
+                assert(after.content.includes('43'), 'обновление не применилось');
+            });
+
+            await check('PUT с устаревшей версией даёт конфликт', async () => {
+                const file = await LocalAPI.readFile(path);
+                const updated = payload.replace('42', '44');
+                await LocalAPI.saveFile(path, updated, '', file.lastCommitId, false);
+
+                let err = null;
+                try {
+                    await LocalAPI.saveFile(path, payload, '', file.lastCommitId, false);
+                } catch (e) { err = e; }
+                assert(err && err.conflict, 'ожидалась ошибка конфликта');
+            });
+
+            await check('POST по существующему пути отклоняется', async () => {
+                let err = null;
+                try {
+                    await LocalAPI.saveFile(path, payload, '', null, true);
+                } catch (e) { err = e; }
+                assert(err && !err.conflict, 'ожидалась обычная ошибка');
+                assert(err.status === 400, 'статус: ' + (err && err.status));
+            });
+
+            const failed = results.filter(r => !r.ok);
+            document.getElementById('results').textContent = results
+                .map(r => (r.ok ? 'PASS ' : 'FAIL ') + r.name + (r.ok ? '' : ' — ' + r.error))
+                .join('\n') + '\nSUMMARY: ' + (failed.length ? 'FAIL' : 'PASS') +
+                ' (' + (results.length - failed.length) + '/' + results.length + ')';
+            document.body.dataset.status = failed.length ? 'fail' : 'pass';
+        })();
+    </script>
+</body>
+</html>
